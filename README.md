@@ -1,12 +1,6 @@
-# ██▄▄ ██▓ ▒█████ ▒█████ ▓█████▄▓██ ██▓
-# ▓█████▄ ▓██▒ ▒██▒ ██▒▒██▒ ██▒▒██▀ ██▌▒██ ██▒
-# ▒██▒ ▄██▒██░ ▒██░ ██▒▒██░ ██▒░██ █▌ ▒██ ██░
-# ▒██░█▀ ▒██░ ▒██ ██░▒██ ██░░▓█▄ ▌ ░ ▐██▓░
-# ░▓█ ▀█▓░██████▒░ ████▓▒░░ ████▓▒░░▒████▓ ░ ██▒▓░
-# ░▒▓███▀▒░ ▒░▓ ░░ ▒░▒░▒░ ░ ▒░▒░▒░ ▒▒▓ ▒ ██▒▒▒
-# ▒░▒ ░ ░ ░ ▒ ░ ░ ▒ ▒░ ░ ▒ ▒░ ░ ▒ ▒ ▓██ ░▒░
-# ░ ░ ░ ░ ░ ░ ▒ ░ ░ ░ ▒ ░ ░ ░ ▒ ▒ ░░
-# ░ ░ ░ ░ ░ ░ ░ ░ ░ ░  
+# █BLOODY 
+
+<img width="1906" height="590" alt="image" src="https://github.com/user-attachments/assets/955beff9-0985-4612-8d54-9830623857a5" />
 
 Reduce token waste and spending when using AI coding models. Compare pricing across **all providers**, compress requests and tool output, route through a local proxy, and track savings — all from a reactive TUI or the command line.
 
