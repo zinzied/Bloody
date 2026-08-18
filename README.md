@@ -1,4 +1,13 @@
-# Bloody
+#  ▄▄▄▄    ██▓     ▒█████   ▒█████  ▓█████▄▓██   ██▓
+▓█████▄ ▓██▒    ▒██▒  ██▒▒██▒  ██▒▒██▀ ██▌▒██  ██▒
+▒██▒ ▄██▒██░    ▒██░  ██▒▒██░  ██▒░██   █▌ ▒██ ██░
+▒██░█▀  ▒██░    ▒██   ██░▒██   ██░░▓█▄   ▌ ░ ▐██▓░
+░▓█  ▀█▓░██████▒░ ████▓▒░░ ████▓▒░░▒████▓  ░ ██▒▓░
+░▒▓███▀▒░ ▒░▓  ░░ ▒░▒░▒░ ░ ▒░▒░▒░  ▒▒▓  ▒   ██▒▒▒ 
+▒░▒   ░ ░ ░ ▒  ░  ░ ▒ ▒░   ░ ▒ ▒░  ░ ▒  ▒ ▓██ ░▒░ 
+ ░    ░   ░ ░   ░ ░ ░ ▒  ░ ░ ░ ▒   ░ ░  ░ ▒ ▒ ░░  
+ ░          ░  ░    ░ ░      ░ ░     ░    ░ ░     
+      ░                            ░      ░ ░     
 
 Reduce token waste and spending when using AI coding models. Compare pricing across **all providers**, compress requests and tool output, route through a local proxy, and track savings — all from a reactive TUI or the command line.
 
