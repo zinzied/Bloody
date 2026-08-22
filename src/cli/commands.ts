@@ -8,6 +8,8 @@ import * as prompts from '../core/prompts.js';
 import * as todo from '../core/todo.js';
 import * as goals from '../core/goals.js';
 import * as reminders from '../core/reminders.js';
+import * as tokens from '../core/tokens.js';
+import * as budget from '../core/budget.js';
 import { fmt } from '../tui/components.js';
 import { BANNER, APP_NAME } from '../banner.js';
 
@@ -67,6 +69,11 @@ COMMANDS
   remind due                         show due reminders
   remind remove <id>                 remove a reminder
   remind clear                       clear all fired reminders
+  tokens info                        tokenizer info (tiktoken vs heuristic)
+  tokens count <text>                count tokens (accurate vs heuristic)
+  tokens estimate '<json>'           estimate tokens for a request body (accurate)
+  budget status                      daily spend vs budget + enforcement guard
+  budget reset                       reset daily budget counters
 `;
 
 function out(line = ''): void {
@@ -137,14 +144,29 @@ async function cmdUsage(): Promise<number> {
 }
 
 async function cmdQuota(): Promise<number> {
-  const { quota, budget } = insights.quotaSummary();
+  const { quota, budget, budgetStatus, budgetDaily } = insights.quotaSummary() as unknown as { quota: Record<string, unknown>; budget: Record<string, unknown> | null; budgetStatus: Record<string, unknown> | null; budgetDaily: Record<string, unknown> | null };
   const budgetData = budget as Record<string, any> | null;
   if (budgetData) {
     out(`Task: ${budgetData.task || '—'}  budget: ${fmt(budgetData.budget_limit)}  allocated: ${fmt(budgetData.total_allocated)}  remaining: ${fmt(budgetData.remaining)}`);
     out(`Allocation: ${Object.entries(budgetData.allocation || {}).map(([k, v]) => `${k.replace(/_/g, ' ')}: ${fmt(v)}`).join(', ')}`);
     out();
   } else {
-    out('No budget.json yet.');
+    out('No budget.json yet (task budget).');
+    out();
+  }
+  if (budgetStatus) {
+    const bs = budgetStatus as Record<string, any>;
+    const pol = bs.policy as Record<string, any>;
+    const daily = bs.daily as Record<string, any>;
+    out(`Daily guard: mode=${pol.mode} budget $${Number(pol.daily_budget_usd).toFixed(2)}/day free ${fmt(pol.free_daily_token_limit)} tok/day`);
+    out(`Spent today: $${Number(bs.spentUSD).toFixed(4)} (${fmt(bs.spentTokens)} tok, ${fmt(daily.requests)} req) · remaining $${Number(bs.remainingUSD).toFixed(4)} / ${fmt(bs.remainingTokens)} tok`);
+    if (bs.exceeded) out(`BUDGET EXCEEDED: ${bs.reason} → fallback ${bs.fallbackModel || '—'} (auto-routing active)`);
+    else out(`Status: OK — no enforcement (${bs.reason || 'within limits'})`);
+    out();
+  }
+  if (budgetDaily) {
+    const bd = budgetDaily as Record<string, any>;
+    out(`Daily state: ${bd.date} · ${fmt(bd.tokensTotal)} tok (in ${fmt(bd.tokensIn)} + out ${fmt(bd.tokensOut)}) · $${Number(bd.costUSD).toFixed(4)} · ${fmt(bd.requests)} req`);
     out();
   }
   const quotaData = quota as Record<string, any>;
@@ -229,16 +251,18 @@ async function cmdCompressTest(args: string[]): Promise<number> {
     outErr('usage: compress test <text>');
     return 1;
   }
-  const r = insights.compressTest(text);
+  const r = insights.compressTest(text) as Record<string, any>;
   out(`Detected filter: ${r.detected ?? 'none'}`);
-  out(`Characters in   : ${fmt(r.length)}`);
+  out(`Characters in   : ${fmt(r.length)}  (tokens accurate ${fmt(r.tokensIn)} / heuristic ${fmt(r.heuristicIn)})`);
   if (r.tooSmall) {
     out(`Input below minimum size (MIN_COMPRESS_SIZE = ${r.min}); passed through.`);
+    out(`Tokenizer: ${r.tokenizer?.available ? `✓ ${r.tokenizer.encoding} (accurate)` : `⚠ heuristic fallback (${r.tokenizer?.fallback})`}`);
     return 0;
   }
-  out(`Characters out  : ${fmt(r.compressed_length ?? r.length)}`);
-  out(`Saved           : ${fmt(r.saved ?? 0)}`);
-  out(`Reduction       : ${r.pct ?? 0}%`);
+  out(`Characters out  : ${fmt(r.compressed_length ?? r.length)}  (tokens accurate ${fmt(r.tokensOut ?? r.tokensIn)} / heuristic ${fmt(r.heuristicOut ?? r.heuristicIn)})`);
+  out(`Saved chars     : ${fmt(r.saved ?? 0)} (${r.pct ?? 0}%)`);
+  if (r.tokensSaved !== undefined) out(`Saved tokens    : ${fmt(r.tokensSaved)} (${r.tokensPct ?? 0}%)  accurate (${r.tokenizer?.encoding})`);
+  out(`Tokenizer: ${r.tokenizer?.available ? `✓ ${r.tokenizer.encoding} — accurate` : `⚠ heuristic fallback`}`);
   if (r.compressed) {
     out();
     out('Compressed:');
@@ -710,6 +734,72 @@ function cmdRemind(args: string[]): number {
   }
 }
 
+function cmdTokens(args: string[]): number {
+  const { positionals } = parseFlags(args);
+  const sub = positionals[0] || 'info';
+  switch (sub) {
+    case 'info': {
+      const info = tokens.tokenizerInfo();
+      out(`Tokenizer: ${info.available ? `✓ ${info.encoding} (js-tiktoken)` : `⚠ heuristic fallback`}  — ${info.fallback}`);
+      if (info.error) out(`Error: ${info.error}`);
+      out(`Heuristic: ${tokens.CHARS_PER_TOKEN} chars/token, overheads block=${tokens.BLOCK_OVERHEAD} role=${tokens.ROLE_OVERHEAD}`);
+      return 0;
+    }
+    case 'count':
+    case 'count_tokens': {
+      const text = positionals.slice(1).join(' ');
+      if (!text) { outErr('usage: tokens count <text>'); return 1; }
+      const accurate = tokens.count_tokens(text);
+      const heuristic = tokens.estimate_text_tokens(text);
+      out(`Text length: ${fmt(text.length)} chars`);
+      out(`Accurate (tiktoken ${tokens.tokenizerInfo().encoding}): ${fmt(accurate)} tokens`);
+      out(`Heuristic (chars/4): ${fmt(heuristic)} tokens`);
+      out(`Delta: ${fmt(accurate - heuristic)} (${accurate ? (((accurate - heuristic) / accurate) * 100).toFixed(1) : 0}%)`);
+      return 0;
+    }
+    case 'estimate': {
+      const raw = positionals.slice(1).join(' ');
+      if (!raw) { outErr(`usage: tokens estimate '<json body>'`); return 1; }
+      let body: Record<string, unknown>;
+      try { body = JSON.parse(raw); } catch { outErr('invalid JSON'); return 1; }
+      const heuristic = tokens.estimate_request_tokens(body as never);
+      const accurate = tokens.estimate_request_tokens_accurate(body as never);
+      out(`Heuristic: ${fmt(heuristic)} tok`);
+      out(`Accurate (${tokens.tokenizerInfo().encoding}): ${fmt(accurate)} tok`);
+      out(`Saved vs heuristic: ${fmt(heuristic - accurate)} tok`);
+      return 0;
+    }
+    default:
+      outErr('usage: tokens info|count <text>|estimate \'<json>\'');
+      return 1;
+  }
+}
+
+function cmdBudget(args: string[]): number {
+  const { positionals } = parseFlags(args);
+  const sub = positionals[0] || 'status';
+  switch (sub) {
+    case 'status': {
+      const s = budget.getBudgetStatus() as unknown as Record<string, unknown>;
+      const pol = s.policy as Record<string, any>;
+      const daily = s.daily as Record<string, any>;
+      out(`Policy: mode=${pol.mode} budget $${Number(pol.daily_budget_usd).toFixed(2)}/day free ${fmt(pol.free_daily_token_limit)}/day max $${pol.max_paid_cost_per_million}/M`);
+      out(`Daily: ${daily.date} · $${Number(s.spentUSD).toFixed(4)} spent (${fmt(s.spentTokens)} tok, ${fmt(daily.requests)} req) · $${Number(s.remainingUSD).toFixed(4)} left / ${fmt(s.remainingTokens)} tok`);
+      if (s.exceeded) out(`ENFORCED: ${s.reason} → fallback ${s.fallbackModel}`);
+      else out(`Status: OK — ${s.reason || 'within limits'}`);
+      return 0;
+    }
+    case 'reset': {
+      budget.resetDailyForTests();
+      out('Daily budget counters reset.');
+      return 0;
+    }
+    default:
+      outErr('usage: budget status|reset');
+      return 1;
+  }
+}
+
 export async function runCommand(argv: string[]): Promise<number> {
   if (!argv.length || argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') {
     out(HELP);
@@ -761,6 +851,10 @@ export async function runCommand(argv: string[]): Promise<number> {
       return cmdGoals(rest);
     case 'remind':
       return cmdRemind(rest);
+    case 'tokens':
+      return cmdTokens(rest);
+    case 'budget':
+      return cmdBudget(rest);
     default:
       outErr(`Unknown command: ${cmd}`);
       outErr(`Run "token-saver help" for usage.`);

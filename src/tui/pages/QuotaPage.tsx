@@ -1,11 +1,14 @@
 import React from 'react';
-import { Page, Section, Row, Stat, Table, Hint, ErrorLine, fmt, countdown, T } from '../components.js';
+import { Box, Text } from 'ink';
+import { Page, Section, Row, Stat, Table, Hint, ErrorLine, Badge, fmt, countdown, T } from '../components.js';
 import { useData } from '../useData.js';
 import { quotaSummary } from '../../core/insights.js';
 
 export function QuotaPage() {
   const { data, error } = useData(() => quotaSummary(), 3000);
   const budget = data?.budget as Record<string, any> | null | undefined;
+  const budgetDaily = data?.budgetDaily as Record<string, any> | null | undefined;
+  const budgetStatus = data?.budgetStatus as Record<string, any> | null | undefined;
   const quota = data?.quota as Record<string, any> | null | undefined;
   const providers = Object.entries(quota?.providers || {});
   const accounts = Object.entries(quota?.accounts || {});
@@ -16,6 +19,51 @@ export function QuotaPage() {
       {!data && !error && <Hint>Loading…</Hint>}
       {data && (
         <>
+          {/* Daily budget enforcement (new) */}
+          {budgetStatus ? (
+            <>
+              <Section title="Daily Budget — auto-fallback guard">
+                <Row>
+                  <Stat label="Policy mode" value={(budgetStatus.policy as any)?.mode || '—'} />
+                  <Stat
+                    label="Daily budget $"
+                    value={`$${Number((budgetStatus.policy as any)?.daily_budget_usd ?? 0).toFixed(2)}`}
+                  />
+                  <Stat
+                    label="Spent today"
+                    value={`$${Number((budgetStatus as any).spentUSD ?? 0).toFixed(4)}`}
+                    sub={`${fmt((budgetStatus as any).spentTokens ?? 0)} tok · ${fmt((budgetStatus as any).daily?.requests ?? 0)} req`}
+                  />
+                  <Stat
+                    label="Remaining $"
+                    value={`$${Number((budgetStatus as any).remainingUSD ?? 0).toFixed(4)}`}
+                    color={Number((budgetStatus as any).remainingUSD) <= 0 ? 'red' : 'green'}
+                  />
+                  <Stat
+                    label="Free tokens left"
+                    value={fmt((budgetStatus as any).remainingTokens)}
+                    sub={`limit ${fmt((budgetStatus as any).policy?.free_daily_token_limit)}`}
+                  />
+                </Row>
+                <Box marginTop={1} flexDirection="row">
+                  {(budgetStatus as any).exceeded ? (
+                    <Badge ok={false}> EXCEEDED — auto-routing to free model: {(budgetStatus as any).fallbackModel || '—'} </Badge>
+                  ) : (
+                    <Badge ok={true}> Budget OK — requests use configured model </Badge>
+                  )}
+                  <Text> </Text>
+                  <Text color="gray">{(budgetStatus as any).reason || 'No limit hit'}</Text>
+                </Box>
+                {budgetDaily && (
+                  <Hint>
+                    Daily state: {(budgetDaily as any).date} · tokens {fmt((budgetDaily as any).tokensTotal)} (in{' '}
+                    {fmt((budgetDaily as any).tokensIn)} + out {fmt((budgetDaily as any).tokensOut)}) · last{' '}
+                    {(budgetDaily as any).lastUpdated ? new Date((budgetDaily as any).lastUpdated).toLocaleString() : '—'}
+                  </Hint>
+                )}
+              </Section>
+            </>
+          ) : null}
           {budget ? (
             <>
               <Row>

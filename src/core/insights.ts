@@ -3,6 +3,8 @@ import { readJson } from './utils.js';
 import * as rtk from './filters/rtk.js';
 import * as routingMod from './routing.js';
 import { accountManager, resolveUpstream } from './proxy.js';
+import * as tokens from './tokens.js';
+import * as budgetMod from './budget.js';
 import { createRequire } from 'node:module';
 import type { SqliteDb, SqliteRow } from './types.js';
 
@@ -108,8 +110,21 @@ export function usageSummary() {
 export function quotaSummary() {
   const quota = readJson(config.QUOTA_TRACKER_PATH) || {};
   const budget = readJson(config.BUDGET_PATH) || null;
-  return { quota, budget };
+  let budgetDaily: Record<string, unknown> | null = null;
+  let budgetStatus: Record<string, unknown> | null = null;
+  try {
+    budgetDaily = budgetMod.loadDailyState() as unknown as Record<string, unknown>;
+    budgetStatus = budgetMod.getBudgetStatus() as unknown as Record<string, unknown>;
+  } catch {}
+  return { quota, budget, budgetDaily, budgetStatus };
 }
+
+export function tokenizerSummary() {
+  const info = tokens.tokenizerInfo();
+  return info;
+}
+
+// We will import budget at top for real implementation – add after fixing imports
 
 export function routingSummary() {
   const pcfg = readJson<Record<string, any>>(config.PROXY_CONFIG) || {};
@@ -286,23 +301,43 @@ export function searchQuery(q: string, limit?: number) {
 export function compressTest(text: string) {
   text = String(text || '');
   const length = text.length;
+  const tokensIn = tokens.count_tokens(text);
+  const heuristicIn = tokens.estimate_text_tokens(text);
   if (length < rtk.MIN_COMPRESS_SIZE) {
-    return { detected: null, tooSmall: true, min: rtk.MIN_COMPRESS_SIZE, length };
+    return {
+      detected: null,
+      tooSmall: true,
+      min: rtk.MIN_COMPRESS_SIZE,
+      length,
+      tokensIn,
+      heuristicIn,
+      tokenizer: tokens.tokenizerInfo(),
+    };
   }
   const fn = rtk.auto_detect_filter(text);
   if (!fn) {
-    return { detected: null, tooSmall: false, length };
+    return { detected: null, tooSmall: false, length, tokensIn, heuristicIn, tokenizer: tokens.tokenizerInfo() };
   }
   const out = rtk.safe_apply(fn, text);
   const same = !out || out.length >= length;
+  const outLen = same ? length : out.length;
+  const tokensOut = same ? tokensIn : tokens.count_tokens(out);
+  const heuristicOut = same ? heuristicIn : tokens.estimate_text_tokens(out);
   return {
     detected: fn.name,
     tooSmall: false,
     length,
-    compressed_length: same ? length : out.length,
+    compressed_length: outLen,
     saved: same ? 0 : length - out.length,
     pct: same ? 0 : Number((((length - out.length) / length) * 100).toFixed(1)),
     compressed: same ? null : out,
+    tokensIn,
+    tokensOut,
+    tokensSaved: same ? 0 : Math.max(0, tokensIn - tokensOut),
+    tokensPct: same || tokensIn === 0 ? 0 : Number((((tokensIn - tokensOut) / tokensIn) * 100).toFixed(1)),
+    heuristicIn,
+    heuristicOut,
+    tokenizer: tokens.tokenizerInfo(),
   };
 }
 

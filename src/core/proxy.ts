@@ -8,6 +8,8 @@ import * as rtk from './filters/rtk.js';
 import * as routing from './routing.js';
 import { QuotaTracker, parse_rate_limit_headers } from './quota.js';
 import * as index from './index.js';
+import * as tokens from './tokens.js';
+import * as budget from './budget.js';
 import type { CompressStats, ProxyConfig, ProxyStatus, RequestBody } from './types.js';
 
 export const DEFAULT_PORT = 8199;
@@ -278,6 +280,27 @@ interface RecordStats {
   bytesAfter: number;
 }
 
+function computeTokenSavings(rawBody: string, outBody: string): { rawTokens: number; outTokens: number; savedTokens: number } {
+  let rawTokens: number;
+  let outTokens: number;
+  try {
+    const rawData = JSON.parse(rawBody);
+    const outData = JSON.parse(outBody);
+    const looksLikeRequest = rawData && (Array.isArray(rawData.messages) || Array.isArray(rawData.input) || typeof rawData.system === 'string');
+    if (looksLikeRequest) {
+      rawTokens = tokens.estimate_request_tokens_accurate(rawData);
+      outTokens = tokens.estimate_request_tokens_accurate(outData);
+    } else {
+      rawTokens = tokens.count_tokens(rawBody);
+      outTokens = tokens.count_tokens(outBody);
+    }
+  } catch {
+    rawTokens = tokens.count_tokens(rawBody);
+    outTokens = tokens.count_tokens(outBody);
+  }
+  return { rawTokens, outTokens, savedTokens: Math.max(0, rawTokens - outTokens) };
+}
+
 function recordHistory(
   pathOnly: string,
   modelId: string,
@@ -288,10 +311,7 @@ function recordHistory(
 ): void {
   try {
     const cfg = loadConfig();
-    const rawBytes = Buffer.byteLength(rawBody || '');
-    const outBytes = Buffer.byteLength(outBody || '');
-    const rawTokens = rawBytes >> 2;
-    const savedTokens = Math.max(0, rawTokens - (outBytes >> 2));
+    const { rawTokens, savedTokens } = computeTokenSavings(rawBody, outBody);
     const saved = stats ? Math.max(0, stats.bytesBefore - stats.bytesAfter) : 0;
     const history = cfg.history || [];
     history.push({
@@ -311,6 +331,11 @@ function recordHistory(
       total_saved_tokens: (Number(cfg.total_saved_tokens) || 0) + savedTokens,
     });
     index.logProxyRequest(pathOnly, modelId || 'unknown', rawTokens, savedTokens);
+    // record daily budget spend (estimate cost from input tokens)
+    try {
+      const cost = budget.estimateCostForRequest(rawTokens, 0, modelId);
+      budget.recordDailySpend({ cost, tokensIn: rawTokens, tokens: rawTokens });
+    } catch {}
   } catch {}
 }
 
@@ -455,12 +480,38 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       data = JSON.parse(raw);
     } catch {}
 
-    const modelId = (data && (data.model || '')) || '';
+    let modelId = (data && (data.model || '')) || '';
     if (data && typeof data.model === 'string' && data.model.includes('/')) {
       const prefix = data.model.split('/', 1)[0];
       if (prefix && (providerBaseUrl(prefix) || prefix === 'opencode' || prefix === 'opencode_go' || prefix === 'opencode-go')) {
         data.model = data.model.slice(prefix.length + 1);
       }
+    }
+    // Budget enforcement: auto-fallback to free/cheap model when daily budget exceeded
+    let budgetEnforced = false;
+    let originalModelId = modelId;
+    let enforcedFallback: string | null = null;
+    if (process.env.TOKENSAVER_BUDGET_ENFORCE !== '0' && data) {
+      try {
+        const check = budget.shouldEnforceBudget();
+        if (check.enforce && check.fallbackModel) {
+          // only enforce if original model is not already the fallback
+          const fallbackShort = check.fallbackModel.includes('/') ? check.fallbackModel.split('/').slice(1).join('/') : check.fallbackModel;
+          const currentShort = String(data.model || modelId).split('/').pop() || '';
+          const fallbackProvider = check.fallbackModel.split('/')[0];
+          const currentProvider = modelProvider(modelId);
+          // enforce if different provider or different model
+          if (fallbackShort !== currentShort || fallbackProvider !== currentProvider) {
+            enforcedFallback = check.fallbackModel;
+            originalModelId = modelId;
+            // data.model should be short id for OpenAI-compatible APIs
+            data.model = fallbackShort;
+            modelId = check.fallbackModel;
+            budgetEnforced = true;
+            console.log(`[budget] daily budget exceeded (${check.reason}) — routing ${originalModelId} → ${check.fallbackModel}`);
+          }
+        }
+      } catch {}
     }
     const resolved = resolveUpstream(modelId, pathOnly);
     let upstreamUrl = resolved.url;
@@ -494,7 +545,16 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       const compressed = rtk.compress_messages(data, true);
       if (compressed) {
         const serialized = JSON.stringify(data);
-        if (serialized.length < raw.length) {
+        if (budgetEnforced) {
+          outBody = serialized;
+          stats = compressed;
+          const log = rtk.format_rtk_log(stats);
+          if (log) console.log(log);
+          if (compressed.bytesBefore !== compressed.bytesAfter) {
+            _metrics.hits += 1;
+            _metrics.totalSavedBytes += Math.max(0, compressed.bytesBefore - compressed.bytesAfter);
+          }
+        } else if (serialized.length < raw.length) {
           outBody = serialized;
           stats = compressed;
           const log = rtk.format_rtk_log(stats);
@@ -502,7 +562,12 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
           _metrics.hits += 1;
           _metrics.totalSavedBytes += Math.max(0, stats.bytesBefore - stats.bytesAfter);
         }
+      } else if (budgetEnforced) {
+        // model was swapped but no compression stats – still need to send rewritten body
+        outBody = JSON.stringify(data);
       }
+    } else if (budgetEnforced && data) {
+      outBody = JSON.stringify(data);
     }
 
     forward(req, res, upstreamUrl, outBody, raw, pathOnly, modelId, stats, account);
