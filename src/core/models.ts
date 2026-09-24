@@ -143,6 +143,9 @@ export function get_user_models_sync(): ProviderCatalog {
       const outp = cost.output || 0;
       const cacheRead = cost.cache_read !== undefined ? cost.cache_read : null;
       const isFree = inp === 0 && outp === 0;
+      const mods = (mdata.modalities && typeof mdata.modalities === 'object') ? mdata.modalities : {};
+      const inMods = Array.isArray(mods.input) ? mods.input.map(String) : ['text'];
+      const outMods = Array.isArray(mods.output) ? mods.output.map(String) : ['text'];
       modelList.push({
         id: `${providerId}/${modelId}`,
         name: mdata.name || modelId,
@@ -156,6 +159,7 @@ export function get_user_models_sync(): ProviderCatalog {
         tool_call: !!mdata.tool_call,
         reasoning: !!mdata.reasoning,
         open_weights: !!mdata.open_weights,
+        modalities: { input: inMods, output: outMods },
       });
     }
     if (modelList.length) {
@@ -192,7 +196,17 @@ export function find_model_in_catalog(catalog: ProviderCatalog, modelId: string)
 }
 
 export function model_total_cost(model: ModelInfo | null | undefined): number {
-  return Number(model && model.input_price) + Number(model && model.output_price);
+  if (!model) return NaN;
+  const anyModel = model as any;
+  const ip = typeof anyModel.input_price === 'number' ? anyModel.input_price : NaN;
+  const op = typeof anyModel.output_price === 'number' ? anyModel.output_price : NaN;
+  if (Number.isFinite(ip) && Number.isFinite(op)) return ip + op;
+  const c = (anyModel.cost && typeof anyModel.cost === 'object')
+    ? anyModel.cost
+    : (anyModel.pricing && typeof anyModel.pricing === 'object' ? anyModel.pricing : {});
+  const i = Number(c.input);
+  const o = Number(c.output);
+  return Number.isFinite(i) && Number.isFinite(o) ? i + o : NaN;
 }
 
 export function read_saver_policy(): SaverPolicy {

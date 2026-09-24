@@ -355,6 +355,94 @@ export function settingsGet() {
   };
 }
 
+export function doctorSummary(opts: { fix?: boolean } = {}) {
+  const quota = readJson<Record<string, any>>(config.QUOTA_TRACKER_PATH) || { providers: {}, accounts: {} };
+  const budgetDaily = (() => {
+    try {
+      return budgetMod.loadDailyState() as unknown as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  })();
+  const budgetStatus = (() => {
+    try {
+      return budgetMod.getBudgetStatus() as unknown as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  })();
+  const tokenizer = tokens.tokenizerInfo();
+  const pcfg = readJson<Record<string, any>>(config.PROXY_CONFIG) || {};
+  const cfg = config.read_config() || {};
+  const currentModel = config.get_current_model();
+  const providers = providersList();
+
+  const issues: string[] = [];
+  const fixes: string[] = [];
+  let fixed = 0;
+
+  // quota rate limits
+  const now = Date.now();
+  for (const [pid, p] of Object.entries((quota.providers || {}) as Record<string, any>)) {
+    const until = p.rate_limited_until ? Date.parse(p.rate_limited_until) : 0;
+    if (until) {
+      const remainingMs = until - now;
+      if (remainingMs <= 0) {
+        issues.push(`stale rate_limit ${pid} expired ${p.rate_limited_until} — should be cleared`);
+        if (opts.fix) {
+          delete (quota.providers as Record<string, any>)[pid].rate_limited_until;
+          delete (quota.providers as Record<string, any>)[pid].rate_limited_model;
+          fixed++;
+          fixes.push(`cleared stale ${pid}`);
+        }
+      } else {
+        issues.push(`rate_limited ${pid} until ${p.rate_limited_until} (${Math.ceil(remainingMs/1000)}s left)`);
+      }
+    }
+  }
+  // auth failures vs rate limit - don't auto-clear 401 inside window
+  // budget
+  if (budgetStatus && (budgetStatus as any).exceeded) {
+    issues.push(`budget exceeded: ${(budgetStatus as any).reason} — fallback ${(budgetStatus as any).fallbackModel} (daily ${(budgetDaily as any)?.tokensTotal} tok)`);
+    if (opts.fix) {
+      // auto-clear only if daily > limit by >2x, suggest raising limit rather than clearing counts
+      fixes.push(`budget exceeded — run 'budget reset' or raise free_daily_token_limit via models policy`);
+    }
+  }
+  // tokenizer
+  if (!tokenizer.available) issues.push(`tokenizer fallback heuristic — js-tiktoken not loaded (${tokenizer.error || 'missing'})`);
+  // proxy
+  if (!pcfg.enabled) issues.push('proxy disabled — requests bypass token-saver');
+  else if (!pcfg.proxied_providers?.length) issues.push('proxy has no proxied_providers — check proxy proxify');
+  // model
+  if (!currentModel) issues.push('no model configured in opencode.jsonc');
+  // auth
+  const working = new Set(config.get_working_providers());
+  if (!working.size) issues.push('no working providers — check auth / env keys (opencode auth list)');
+  if (opts.fix && fixed) {
+    try {
+      const { writeJson } = require('./utils.js') as typeof import('./utils.js');
+      (writeJson as any)(config.QUOTA_TRACKER_PATH, quota);
+      fixes.push(`wrote ${config.QUOTA_TRACKER_PATH}`);
+    } catch {}
+  }
+
+  return {
+    ok: issues.length === 0,
+    issues,
+    fixes,
+    fixed,
+    quota,
+    budgetDaily,
+    budgetStatus,
+    tokenizer,
+    proxy: pcfg,
+    config: cfg,
+    currentModel,
+    providers,
+  };
+}
+
 export function settingsSave(opts: { model?: string; small_model?: string } = {}) {
   const { model, small_model } = opts;
   const current = settingsGet();

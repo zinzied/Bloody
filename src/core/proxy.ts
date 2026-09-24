@@ -1,15 +1,18 @@
 import http from 'node:http';
 import https from 'node:https';
 import fs from 'node:fs';
-import { nowIso, readJson, writeJson } from './utils.js';
-import { PROXY_CONFIG, CACHE_PATH, read_config, get_current_model, set_provider_base_urls } from './config.js';
-import { readCatalogCache } from './models.js';
+import os from 'node:os';
+import path from 'node:path';
+import { nowIso, readJson, writeJson, ensureDir } from './utils.js';
+import { PROXY_CONFIG, CACHE_PATH, SAVER_POLICY_PATH, read_config, get_current_model, set_provider_base_urls, restore_provider_base_urls } from './config.js';
+import { readCatalogCache, get_user_models_sync, model_total_cost } from './models.js';
 import * as rtk from './filters/rtk.js';
 import * as routing from './routing.js';
 import { QuotaTracker, parse_rate_limit_headers } from './quota.js';
 import * as index from './index.js';
 import * as tokens from './tokens.js';
 import * as budget from './budget.js';
+import { initControlApi, emitEvent, EVENT_TOPICS, handleControlApi } from './control-api.js';
 import type { CompressStats, ProxyConfig, ProxyStatus, RequestBody } from './types.js';
 
 export const DEFAULT_PORT = 8199;
@@ -154,8 +157,96 @@ function isSelfUrl(url: string): boolean {
   return new RegExp(`127\\.0\\.0\\.1:${port}|localhost:${port}`).test(url || '');
 }
 
-export function defaultUpstream(): { pid: string; base: string } {
-  const cfg = loadConfig();
+const AUTH_FILE = path.join(os.homedir(), '.local', 'share', 'opencode', 'auth.json');
+const PROVIDER_ENV_KEYS: Record<string, string[]> = {
+  zai: ['ZAI_API_KEY', 'Z_AI_API_KEY', 'ZHIPU_API_KEY'],
+  openai: ['OPENAI_API_KEY'],
+  anthropic: ['ANTHROPIC_API_KEY'],
+  deepseek: ['DEEPSEEK_API_KEY'],
+  groq: ['GROQ_API_KEY'],
+  openrouter: ['OPENROUTER_API_KEY'],
+};
+
+function apiKeyForProvider(pid: string): string {
+  if (!pid) return '';
+  for (const envName of PROVIDER_ENV_KEYS[pid] || []) {
+    const v = process.env[envName];
+    if (v) return v;
+  }
+  try {
+    const auth = readJson<Record<string, any>>(AUTH_FILE, {}) || {};
+    const entry = auth[pid];
+    if (!entry) return '';
+    if (entry.api?.key) return String(entry.api.key);
+    if (entry.key) return String(entry.key);
+    if (entry.access) return String(entry.access);
+  } catch {}
+  return '';
+}
+
+function fallbackModelForProvider(pid: string): string {
+  try {
+    const cfg = read_config();
+    const small = cfg && cfg.small_model ? String(cfg.small_model) : '';
+    if (small && small.split('/')[0] === pid) return small.split('/').slice(1).join('/');
+  } catch {}
+  try {
+    const catalog = get_user_models_sync();
+    const group = Object.values(catalog).find((g) => g.id === pid);
+    if (group) {
+      let bestId = '';
+      let bestCost = Infinity;
+      for (const m of group.models) {
+        if (!m.modalities.input.includes('text') || !m.modalities.output.includes('text')) continue;
+        const c = model_total_cost(m);
+        if (Number.isFinite(c)) {
+          if (c < bestCost) {
+            bestCost = c;
+            bestId = m.id;
+          }
+        } else if (!bestId) {
+          bestId = m.id;
+        }
+      }
+      if (bestId) return bestId.split('/').slice(1).join('/');
+    }
+  } catch {}
+  return '';
+}
+
+export function pickHealthyFallback(excludeProvider: string): string | null {
+  const current = get_current_model();
+  const curPid = current ? current.split('/')[0] : '';
+  if (curPid && curPid !== excludeProvider && !quotaTracker.is_rate_limited(curPid)) {
+    const curBase = providerBaseUrl(curPid);
+    if (curBase && !isSelfUrl(curBase) && apiKeyForProvider(curPid)) return current;
+  }
+  const auth = readJson<Record<string, any>>(AUTH_FILE, {}) || {};
+  for (const pid of Object.keys(auth)) {
+    if (pid === excludeProvider || pid === curPid) continue;
+    if (quotaTracker.is_rate_limited(pid)) continue;
+    const base = providerBaseUrl(pid);
+    if (!base || isSelfUrl(base)) continue;
+    if (!apiKeyForProvider(pid)) continue;
+    const mid = fallbackModelForProvider(pid);
+    if (mid) return `${pid}/${mid}`;
+  }
+  const policy = readJson<any>(SAVER_POLICY_PATH, {}) || {};
+  const rec = policy.last_recommendation || {};
+  const candidates: string[] = [rec.small_model, rec.main_model, ...(Array.isArray(rec.fallbacks) ? rec.fallbacks : [])];
+  for (const c of candidates) {
+    if (!c || typeof c !== 'string' || !c.includes('/')) continue;
+    const pid = c.split('/')[0];
+    if (pid === excludeProvider) continue;
+    if (!providerBaseUrl(pid)) continue;
+    if (quotaTracker.is_rate_limited(pid)) continue;
+    if (!apiKeyForProvider(pid)) continue;
+    return c;
+  }
+  return null;
+}
+
+export function defaultUpstream(): { pid: string; base: string } {  const cfg = loadConfig();
   const candidates: string[] = [];
   for (const pid of cfg.proxied_providers || []) candidates.push(pid);
   for (const pid of Object.keys(cfg.saved_base_urls || {})) candidates.push(pid);
@@ -363,8 +454,25 @@ function forward(
     const provider = modelProvider(modelId);
     try {
       if (statusCode >= 400) {
-        const cooldown = routing.check_fallback_error(statusCode, '').cooldown_ms;
-        quotaTracker.mark_rate_limited(provider, modelId, cooldown, account && account.id);
+        if (statusCode === 429) {
+          quotaTracker.mark_rate_limited(provider, modelId, 30 * 60 * 1000, account && account.id);
+          emitEvent(EVENT_TOPICS.providerRatelimited, {
+            provider,
+            model: modelId,
+            statusCode,
+            cooldownMs: 30 * 60 * 1000,
+            accountId: account && account.id,
+          });
+        } else if (statusCode >= 500) {
+          quotaTracker.mark_rate_limited(provider, modelId, 60 * 1000, account && account.id);
+          emitEvent(EVENT_TOPICS.providerRatelimited, {
+            provider,
+            model: modelId,
+            statusCode,
+            cooldownMs: 60 * 1000,
+            accountId: account && account.id,
+          });
+        }
       } else {
         const parsed = parse_rate_limit_headers((upRes && upRes.headers) || null);
         if (parsed) {
@@ -453,8 +561,14 @@ function forwardGet(req: http.IncomingMessage, res: http.ServerResponse, pathOnl
   upReq.end();
 }
 
-function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
+async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const pathOnly = (req.url || '').split('?')[0];
+
+  // Control API /api/* (before any LLM traffic handling)
+  if (pathOnly.startsWith('/api/')) {
+    const handled = await handleControlApi(req, res, pathOnly);
+    if (handled) return;
+  }
 
   if (req.method === 'GET' && (pathOnly === '/health' || pathOnly === '/status')) {
     return respondJson(res, 200, status());
@@ -509,6 +623,35 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
             modelId = check.fallbackModel;
             budgetEnforced = true;
             console.log(`[budget] daily budget exceeded (${check.reason}) — routing ${originalModelId} → ${check.fallbackModel}`);
+            emitEvent(EVENT_TOPICS.budgetExceeded, {
+              reason: check.reason,
+              fallbackModel: check.fallbackModel,
+              originalModel: originalModelId,
+            });
+          }
+        }
+      } catch {}
+    }
+    // Rate-limit aware routing: transparently reroute to a healthy provider when
+    // the requested provider is marked rate-limited (kills client retry loops).
+    let rateLimitReroutedFrom: string | null = null;
+    if (data && !budgetEnforced && process.env.TOKENSAVER_RATELIMIT_FALLBACK !== '0') {
+      try {
+        const reqProvider = modelProvider(modelId);
+        if (reqProvider && quotaTracker.is_rate_limited(reqProvider)) {
+          const fb = pickHealthyFallback(reqProvider);
+          if (fb) {
+            const fbProvider = fb.split('/')[0];
+            const fbShort = fb.split('/').slice(1).join('/');
+            rateLimitReroutedFrom = modelId;
+            data.model = fbShort;
+            modelId = fb;
+            console.log(`[ratelimit] ${reqProvider} is rate-limited — rerouting ${rateLimitReroutedFrom} → ${fb}`);
+            emitEvent(EVENT_TOPICS.providerRatelimited, {
+              provider: reqProvider,
+              reroutedTo: fb,
+              originalModel: rateLimitReroutedFrom,
+            });
           }
         }
       } catch {}
@@ -534,6 +677,27 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
         upstreamUrl = String(account.base_url).replace(/\/+$/, '') + canonicalEndpoint(pathOnly);
       }
     } catch {}
+    if (!account && rateLimitReroutedFrom) {
+      // cross-provider reroute: swap the client's (dead) credential for the healthy provider's key
+      try {
+        const pid = modelProvider(modelId);
+        const key = apiKeyForProvider(pid);
+        if (key) {
+          account = {
+            id: `authfile:${pid}`,
+            provider: pid,
+            api_key: key,
+            base_url: '',
+            priority: 1,
+            enabled: true,
+            consecutive_errors: 0,
+            rate_limited_until: null,
+          } as unknown as routing.Account;
+        } else {
+          console.log(`[ratelimit] no API key found for '${pid}' — client Authorization passed through unchanged`);
+        }
+      } catch {}
+    }
 
     _metrics.requestsServed += 1;
     _metrics.lastModel = modelId || 'unknown';
@@ -541,11 +705,12 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
 
     let outBody = raw;
     let stats: CompressStats | null = null;
+    const forceRewrite = budgetEnforced || !!rateLimitReroutedFrom;
     if (data) {
       const compressed = rtk.compress_messages(data, true);
       if (compressed) {
         const serialized = JSON.stringify(data);
-        if (budgetEnforced) {
+        if (forceRewrite || serialized.length < raw.length) {
           outBody = serialized;
           stats = compressed;
           const log = rtk.format_rtk_log(stats);
@@ -554,20 +719,10 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
             _metrics.hits += 1;
             _metrics.totalSavedBytes += Math.max(0, compressed.bytesBefore - compressed.bytesAfter);
           }
-        } else if (serialized.length < raw.length) {
-          outBody = serialized;
-          stats = compressed;
-          const log = rtk.format_rtk_log(stats);
-          if (log) console.log(log);
-          _metrics.hits += 1;
-          _metrics.totalSavedBytes += Math.max(0, stats.bytesBefore - stats.bytesAfter);
         }
-      } else if (budgetEnforced) {
-        // model was swapped but no compression stats – still need to send rewritten body
+      } else if (forceRewrite) {
         outBody = JSON.stringify(data);
       }
-    } else if (budgetEnforced && data) {
-      outBody = JSON.stringify(data);
     }
 
     forward(req, res, upstreamUrl, outBody, raw, pathOnly, modelId, stats, account);
@@ -592,6 +747,7 @@ export function status(): ProxyStatus {
     startedAt: _metrics.startedAt,
     proxiedProviders: cfg.proxied_providers || [],
     upstreams: cfg.upstreams || {},
+    caps: rtk.get_filter_caps(),
   };
 }
 
@@ -721,7 +877,11 @@ export function ensureProxiedProviders(port?: number, rewriteConfig = false): Pr
 export function start(port?: number): Promise<ProxyStatus> {
   return new Promise((resolve, reject) => {
     if (_server) return resolve(status());
+    // Activate budget enforcement + rate-limit fallback by default
+    if (process.env.TOKENSAVER_BUDGET_ENFORCE === undefined) process.env.TOKENSAVER_BUDGET_ENFORCE = '1';
+    if (process.env.TOKENSAVER_RATELIMIT_FALLBACK === undefined) process.env.TOKENSAVER_RATELIMIT_FALLBACK = '1';
     const targetPort = port !== undefined && port !== null ? port : loadConfig().port || DEFAULT_PORT;
+    rtk.set_filter_caps && rtk.set_filter_caps(loadConfig().caps || {});
     const proxify = ensureProxiedProviders(targetPort, true);
     if (proxify.rewritten.length) {
       console.log(`[proxy] routed through proxy: ${proxify.rewritten.join(', ')} (restart opencode if running)`);
@@ -731,6 +891,8 @@ export function start(port?: number): Promise<ProxyStatus> {
       _server = null;
       reject(e);
     });
+    // Initialize control API (REST + WS) on the same server
+    initControlApi(server, targetPort);
     server.listen(targetPort, '127.0.0.1', () => {
       _server = server;
       _port = (server.address() as any).port as number;
@@ -741,12 +903,55 @@ export function start(port?: number): Promise<ProxyStatus> {
   });
 }
 
+function exportSessionSummary(): void {
+  try {
+    const memDir = path.join(os.homedir(), '.claude', 'projects', 'C--Users-zinzi-Desktop-Bloody', 'memory');
+    ensureDir(memDir);
+    const s = status();
+    const today = new Date().toISOString().slice(0, 10);
+    const summaryPath = path.join(memDir, `proxy-session-${today}.md`);
+    const budgetStatus = budget.getBudgetStatus() as unknown as Record<string, any>;
+    const rateLimitedProviders: string[] = [];
+    // Check each known provider for rate-limit status
+    const cfg = loadConfig();
+    for (const pid of Object.keys(cfg.upstreams || {})) {
+      if (quotaTracker.is_rate_limited(pid)) rateLimitedProviders.push(pid);
+    }
+    const lines: string[] = [
+      `## Proxy Session — ${today}`,
+      '',
+      `- Port: ${s.port}`,
+      `- Requests served: ${s.requestsServed}`,
+      `- Compression hits: ${s.compressionHits}`,
+      `- Bytes saved: ${(s.totalSavedBytes || 0).toLocaleString()}B`,
+      `- Last model: ${s.lastModel || '—'}`,
+      `- Proxied providers: ${(s.proxiedProviders || []).join(', ') || '—'}`,
+      `- Budget spent today: $${Number(budgetStatus?.spentUSD || 0).toFixed(4)}`,
+      `- Rate-limited providers: ${rateLimitedProviders.length ? rateLimitedProviders.join(', ') : 'none'}`,
+    ];
+    fs.writeFileSync(summaryPath, lines.join('\n') + '\n', 'utf-8');
+  } catch {}
+}
+
+export function restoreDirectUrls(): string[] {
+  const cfg = loadConfig();
+  const saved = cfg.saved_base_urls || {};
+  return restore_provider_base_urls(saved);
+}
+
 export function stop(): Promise<ProxyStatus> {
   return new Promise((resolve) => {
     if (!_server) return resolve(status());
     const server = _server;
+    // restore the real upstream URLs so clients work without the proxy running
+    try {
+      const restored = restoreDirectUrls();
+      if (restored.length) console.log(`[proxy] restored direct URLs for: ${restored.join(', ')} (clients no longer need this proxy)`);
+    } catch {}
     server.close(() => {
       if (_server === server) _server = null;
+      emitEvent(EVENT_TOPICS.proxyStopped, { ts: Date.now() });
+      exportSessionSummary();
       resolve(status());
     });
   });

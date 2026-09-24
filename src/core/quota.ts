@@ -1,5 +1,6 @@
 import { QUOTA_TRACKER_PATH } from './config.js';
 import { readJson, writeJson, nowIsoUtc } from './utils.js';
+import fs from 'node:fs';
 
 export interface QuotaOpts {
   total?: number | null;
@@ -24,6 +25,7 @@ interface QuotaEntry {
 export class QuotaTracker {
   dataFile: string;
   _quotaData: { providers: Record<string, any>; accounts: Record<string, any> };
+  _mtime = 0;
 
   constructor() {
     this.dataFile = QUOTA_TRACKER_PATH;
@@ -32,12 +34,30 @@ export class QuotaTracker {
 
   _load(): { providers: Record<string, any>; accounts: Record<string, any> } {
     const data = readJson<{ providers?: Record<string, any>; accounts?: Record<string, any> }>(this.dataFile, null);
-    if (data && data.providers && data.accounts) return { providers: data.providers, accounts: data.accounts };
+    if (data && data.providers && data.accounts) {
+      try {
+        this._mtime = fs.statSync(this.dataFile).mtimeMs;
+      } catch {}
+      return { providers: data.providers, accounts: data.accounts };
+    }
     return { providers: {}, accounts: {} };
+  }
+
+  _refresh(): void {
+    let mtime = 0;
+    try {
+      mtime = fs.statSync(this.dataFile).mtimeMs;
+    } catch {
+      return;
+    }
+    if (mtime !== this._mtime) this._quotaData = this._load();
   }
 
   _save(): void {
     writeJson(this.dataFile, this._quotaData);
+    try {
+      this._mtime = fs.statSync(this.dataFile).mtimeMs;
+    } catch {}
   }
 
   update_quota(provider: string, model: string | null = null, opts: QuotaOpts = {}): void {
@@ -82,14 +102,17 @@ export class QuotaTracker {
   }
 
   get_quota(provider: string): Record<string, any> {
+    this._refresh();
     return this._quotaData.providers[provider] || {};
   }
 
   get_account(accountId: string): Record<string, any> {
+    this._refresh();
     return this._quotaData.accounts[accountId] || {};
   }
 
   get_reset_countdown(provider: string): string | null {
+    this._refresh();
     const prov = this._quotaData.providers[provider] || {};
     const resetAt = prov.reset_at;
     if (!resetAt) return null;
@@ -108,6 +131,7 @@ export class QuotaTracker {
   }
 
   is_rate_limited(provider: string, accountId: string | null = null): boolean {
+    this._refresh();
     const now = Date.now();
     if (accountId) {
       const acc = this._quotaData.accounts[accountId] || {};
@@ -133,6 +157,7 @@ export class QuotaTracker {
   }
 
   get_summary(): QuotaEntry[] {
+    this._refresh();
     const summary: QuotaEntry[] = [];
     for (const [provider, data] of Object.entries(this._quotaData.providers)) {
       const entry: QuotaEntry = { provider };

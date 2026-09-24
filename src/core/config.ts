@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { sha256Hex, md5Hex, nowIso, ensureDir, readJson, writeJson } from './utils.js';
+export { ensureDir } from './utils.js';
 
 export const TS_VERSION = '10.0.0';
 
@@ -333,6 +334,31 @@ export function set_provider_base_urls(proxyUrl: string, providers: string[]): s
     if (cur && /127\.0\.0\.1:\d+|localhost:\d+/.test(cur)) continue;
     const opts = cfg.provider[pid].options || {};
     opts.baseURL = proxyUrl;
+    cfg.provider[pid].options = opts;
+    changed.push(pid);
+  }
+  if (!changed.length) return changed;
+  try {
+    if (fs.existsSync(CONFIG_PATH)) rotate_backup();
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + '\n', 'utf-8');
+  } catch {
+    return [];
+  }
+  return changed;
+}
+
+export function restore_provider_base_urls(saved: Record<string, string>): string[] {
+  const cfg = read_config();
+  if (!cfg || !cfg.provider) return [];
+  const changed: string[] = [];
+  const selfHost = /127\.0\.0\.1:\d+|localhost:\d+/;
+  for (const [pid, realUrl] of Object.entries(saved)) {
+    if (!realUrl || typeof cfg.provider[pid] !== 'object' || cfg.provider[pid] === null) continue;
+    const opts = cfg.provider[pid].options || {};
+    const cur = String(opts.baseURL || '').replace(/\/+$/, '');
+    // only restore entries that currently point at a local proxy address
+    if (!cur || !selfHost.test(cur)) continue;
+    opts.baseURL = String(realUrl).replace(/\/+$/, '');
     cfg.provider[pid].options = opts;
     changed.push(pid);
   }

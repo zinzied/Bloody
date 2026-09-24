@@ -1,0 +1,17 @@
+[package]
+name = "bloody-desktop"
+version = "10.0.0"
+description = "Bloody token saver desktop app"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["notification", "tray-icon", "process", "fs", "dialog", "shell", "http", "websocket", "updater"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"
+url = "2.5"

@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { COMPRESS_DIR } from './config.js';
 
 export interface SpillConfig {
   thresholdChars: number;
@@ -13,10 +14,7 @@ export const DEFAULT_SPILL_CONFIG: SpillConfig = {
   thresholdChars: 16384,
   previewHeadChars: 2048,
   previewTailChars: 512,
-  spillDir: path.join(
-    process.env.HOME || process.env.USERPROFILE || '.',
-    '.config', 'opencode', 'spill',
-  ),
+  spillDir: path.join(COMPRESS_DIR, '..', 'spill'),
 };
 
 const SPILL_MARKER = '\n\n[... full output spilled to disk ...]\n\n';
@@ -63,6 +61,23 @@ export function spillIfNeeded(
     originalSize,
     previewSize: preview.length,
   };
+}
+
+export function spillIdToPath(id: string): string {
+  const clean = id.replace(/^spill-/, '').replace(/\.txt$/, '');
+  return path.join(DEFAULT_SPILL_CONFIG.spillDir, `spill-${clean}.txt`);
+}
+
+export function resolveSpillFile(target: string): string | null {
+  const candidates: string[] = [target, spillIdToPath(target)];
+  if (!path.isAbsolute(target)) {
+    candidates.push(path.join(DEFAULT_SPILL_CONFIG.spillDir, target));
+  }
+  for (const c of candidates) {
+    const abs = path.isAbsolute(c) ? c : path.resolve(c);
+    if (fs.existsSync(abs)) return abs;
+  }
+  return null;
 }
 
 export function readSpill(spillPath: string): string | null {

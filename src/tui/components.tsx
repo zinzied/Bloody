@@ -1,6 +1,8 @@
-import React, { type ReactNode } from 'react';
+import React, { useEffect, useState, type ReactNode } from 'react';
 import { Box, Text } from 'ink';
+import stringWidth from 'string-width';
 import { useScreenInput, type KeyEvent } from './input.js';
+import { theme } from './theme.js';
 
 export const fmt = (n: unknown): string => {
   const num = Number(n);
@@ -39,10 +41,10 @@ export const uptime = (startedAt?: string | null): string => {
 export function Page({ title, sub, children }: { title: string; sub?: string; children?: ReactNode }) {
   return (
     <Box flexDirection="column" flexGrow={1} padding={1}>
-      <Text bold color="cyan">
+      <Text bold color={theme.accent}>
         {title}
       </Text>
-      {sub ? <Text color="gray">{sub}</Text> : null}
+      {sub ? <Text color={theme.dim}>{sub}</Text> : null}
       <Box flexDirection="column" marginTop={1}>
         {children}
       </Box>
@@ -53,7 +55,7 @@ export function Page({ title, sub, children }: { title: string; sub?: string; ch
 export function Section({ title, children }: { title: string; children?: ReactNode }) {
   return (
     <Box flexDirection="column" marginTop={1}>
-      <Text bold color="yellow">
+      <Text bold color={theme.section}>
         {title}
       </Text>
       <Box flexDirection="column" marginTop={1}>
@@ -74,16 +76,16 @@ export function Row({ children }: { children?: ReactNode }) {
 export function Stat({ label, value, sub, width = 26, color }: { label: string; value?: ReactNode; sub?: string; width?: number; color?: string }) {
   return (
     <Box flexDirection="column" width={width} marginRight={2} marginBottom={1}>
-      <Text color="gray">{label}</Text>
+      <Text color={theme.dim}>{label}</Text>
       <Text bold color={color}>{value === undefined || value === null ? '—' : value}</Text>
-      {sub ? <Text color="gray">{sub}</Text> : null}
+      {sub ? <Text color={theme.dim}>{sub}</Text> : null}
     </Box>
   );
 }
 
 export function Badge({ ok, children }: { ok: boolean; children: ReactNode }) {
   return (
-    <Text backgroundColor={ok ? 'green' : 'red'} color="black">
+    <Text backgroundColor={ok ? theme.ok : theme.err} color={theme.inverse}>
       {' '}
       {children}{' '}
     </Text>
@@ -91,15 +93,55 @@ export function Badge({ ok, children }: { ok: boolean; children: ReactNode }) {
 }
 
 export function Hint({ children }: { children?: ReactNode }) {
-  return <Text color="gray">{children}</Text>;
+  return <Text color={theme.dim}>{children}</Text>;
 }
 
 export function ErrorLine({ children }: { children?: ReactNode }) {
-  return <Text color="red">{children}</Text>;
+  return <Text color={theme.err}>{children}</Text>;
 }
 
 export function SuccessLine({ children }: { children?: ReactNode }) {
-  return <Text color="green">{children}</Text>;
+  return <Text color={theme.ok}>{children}</Text>;
+}
+
+const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/** Animated braille spinner. Keep it in a leaf so its tick doesn't re-render whole pages. */
+export function Spinner({ label = 'Loading…', intervalMs = 90 }: { label?: string; intervalMs?: number }) {
+  const [frame, setFrame] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setFrame((f) => (f + 1) % SPINNER_FRAMES.length), intervalMs);
+    return () => clearInterval(t);
+  }, [intervalMs]);
+  return (
+    <Text color={theme.accent}>
+      {SPINNER_FRAMES[frame]} <Text color={theme.dim}>{label}</Text>
+    </Text>
+  );
+}
+
+const METER_BLOCKS = ['█', '▓', '▒', '░'];
+
+function meterColor(ratio: number): string {
+  if (ratio >= 0.85) return theme.err;
+  if (ratio >= 0.6) return theme.section;
+  return theme.ok;
+}
+
+/** Graphical utilization bar: filled block chars scaled to `cols`, colored by threshold. */
+export function Meter({ value, max, label, cols = 20, suffix }: { value: number; max: number; label?: string; cols?: number; suffix?: string }) {
+  const ratio = max > 0 ? Math.min(1, Math.max(0, value / max)) : 0;
+  const filled = Math.round(ratio * cols);
+  const partialIdx = filled >= cols ? 0 : Math.min(METER_BLOCKS.length - 1, Math.floor((ratio * cols - filled) * METER_BLOCKS.length));
+  const bar = '█'.repeat(filled) + (filled < cols && ratio > 0 ? METER_BLOCKS[partialIdx] : '') + '░'.repeat(Math.max(0, cols - filled - (ratio > 0 && filled < cols ? 1 : 0)));
+  const pct = `${Math.round(ratio * 100)}%`;
+  return (
+    <Box>
+      {label ? <Text color={theme.dim}>{`${label} `}</Text> : null}
+      <Text color={meterColor(ratio)}>{bar}</Text>
+      <Text color={theme.dim}>{suffix ? ` ${pct} ${suffix}` : ` ${pct}`}</Text>
+    </Box>
+  );
 }
 
 export interface Cell {
@@ -114,12 +156,21 @@ export const T = (text: unknown, color?: string, bold?: boolean): Cell => ({
   bold,
 });
 
+function visibleWidth(text: string): number {
+  return stringWidth(text);
+}
+
+function padVisible(text: string, width: number): string {
+  const vw = visibleWidth(text);
+  return text + ' '.repeat(Math.max(0, width - vw));
+}
+
 function renderCell(cellValue: Cell, width: number, isHead: boolean): ReactNode {
   const text = isHead ? cellValue.text.toUpperCase() : cellValue.text;
-  const padded = text.padEnd(Math.max(0, width + 2));
+  const padded = padVisible(text, width + 2);
   if (isHead) {
     return (
-      <Text key={`${cellValue.text}-${width}`} bold color="cyan">
+      <Text key={`${cellValue.text}-${width}`} bold color={theme.accent}>
         {padded}
       </Text>
     );
@@ -134,7 +185,7 @@ function renderCell(cellValue: Cell, width: number, isHead: boolean): ReactNode 
 export function Table({ head, rows }: { head: string[]; rows: Cell[][] }) {
   if (!rows.length) return <Hint>No data yet.</Hint>;
   const widths = head.map((h, i) =>
-    Math.max(h.length, ...rows.map((r) => (r[i] ? r[i].text.length : 0)))
+    Math.max(visibleWidth(h), ...rows.map((r) => (r[i] ? visibleWidth(r[i].text) : 0)))
   );
   const heads = head.map((h) => ({ text: h })) as Cell[];
   return (
@@ -192,7 +243,7 @@ export function TextField({
   const display = shown || (placeholder ? placeholder : ' ');
   return (
     <Box>
-      <Text color="cyan">{label}: </Text>
+      <Text color={theme.accent}>{label}: </Text>
       <Text backgroundColor="black">{display}</Text>
       <Text> </Text>
     </Box>

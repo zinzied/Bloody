@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useState, useMemo } from 'react';
 import { Box, Text } from 'ink';
 import { InputProvider, type KeyEvent } from './input.js';
 import { OverviewPage } from './pages/OverviewPage.js';
@@ -14,6 +14,8 @@ import { TodoPage } from './pages/TodoPage.js';
 import { GoalsPage } from './pages/GoalsPage.js';
 import { SettingsPage } from './pages/SettingsPage.js';
 import { APP_NAME } from '../banner.js';
+import { TS_VERSION } from '../core/config.js';
+import { theme } from './theme.js';
 
 export const NAV = [
   { id: 'overview', label: 'Overview' },
@@ -33,13 +35,13 @@ export const NAV = [
 function Sidebar({ active }: { active: number }) {
   return (
     <Box flexDirection="column" width={18} paddingTop={1} paddingLeft={1} paddingRight={1}>
-      <Text bold color="magenta">
+      <Text bold color={theme.brand}>
         {APP_NAME}
       </Text>
-      <Text color="gray">v10.0.0</Text>
+      <Text color={theme.dim}>v{TS_VERSION}</Text>
       <Box flexDirection="column" marginTop={1}>
         {NAV.map((item, i) => (
-          <Text key={item.id} color={i === active ? 'cyan' : 'gray'} bold={i === active}>
+          <Text key={item.id} color={i === active ? theme.accent : theme.dim} bold={i === active}>
             {i === active ? '› ' : '  '}
             {item.label}
           </Text>
@@ -64,31 +66,34 @@ function Shell({ onExit }: { onExit: () => void }) {
     [onExit]
   );
 
-  const pages = [
-    <OverviewPage key="overview" />,
-    <UsagePage key="usage" />,
-    <QuotaPage key="quota" />,
-    <CompressPage key="compress" />,
-    <ProxyPage key="proxy" />,
-    <RoutingPage key="routing" />,
-    <ProvidersPage key="providers" />,
-    <ModelsPage key="models" />,
-    <SearchPage key="search" />,
-    <TodoPage key="todo" />,
-    <GoalsPage key="goals" />,
-    <SettingsPage key="settings" />,
-  ];
+  const pages = useMemo(
+    () => [
+      <OverviewPage key="overview" />,
+      <UsagePage key="usage" />,
+      <QuotaPage key="quota" />,
+      <CompressPage key="compress" />,
+      <ProxyPage key="proxy" />,
+      <RoutingPage key="routing" />,
+      <ProvidersPage key="providers" />,
+      <ModelsPage key="models" />,
+      <SearchPage key="search" />,
+      <TodoPage key="todo" />,
+      <GoalsPage key="goals" />,
+      <SettingsPage key="settings" />,
+    ],
+    []
+  );
 
   return (
     <InputProvider onKey={handleGlobal}>
       <Box flexDirection="row" flexGrow={1}>
         <Sidebar active={active} />
-        <Box flexDirection="column" flexGrow={1} borderStyle="round" borderColor="cyan">
+        <Box flexDirection="column" flexGrow={1} borderStyle="round" borderColor={theme.accent}>
           {pages[active]}
         </Box>
       </Box>
       <Box paddingLeft={1} paddingBottom={1}>
-        <Text color="gray">
+        <Text color={theme.dim}>
           Up/Down: navigate · q: quit · Esc: back/cancel. Pages with inputs accept Enter/Esc.
         </Text>
       </Box>

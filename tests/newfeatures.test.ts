@@ -141,6 +141,34 @@ test('spill does not spill small text', () => {
   assert.strictEqual(result.spilled, false);
 });
 
+test('compress_text spills oversized unclassified tool output via the proxy path', () => {
+  rtk.set_filter_caps({ spillThreshold: 600 });
+  const stats: any = { bytesBefore: 0, bytesAfter: 0, hits: [] };
+  const large = 'y'.repeat(10 * 1024 * 1024 + 100);
+  const out = rtk.compress_text(large, stats);
+  assert.ok(out.length < large.length, 'preview must be shorter than the original');
+  assert.ok(out.includes('full output spilled to disk'), 'marker missing in: ' + out);
+  const dir = spill.DEFAULT_SPILL_CONFIG.spillDir;
+  const files = fs.readdirSync(dir).filter((f) => f.startsWith('spill-'));
+  assert.ok(files.length > 0, 'spill file should exist in ' + dir);
+  const full = spill.readSpill(path.join(dir, files[0]));
+  assert.strictEqual(full, large);
+  assert.ok(stats.hits.some((h: any) => h.filter === 'spill'));
+  spill.cleanSpills(0);
+  rtk.set_filter_caps({ spillThreshold: rtk.SPILL_THRESHOLD });
+});
+
+test('set_filter_caps/get_filter_caps roundtrip and reject invalid', () => {
+  const before = rtk.get_filter_caps();
+  assert.strictEqual(before.testFailuresMax, rtk.TEST_FAILURES_MAX);
+  rtk.set_filter_caps({ testFailuresMax: 3, spillThreshold: 0, longLineMax: 500 });
+  const after = rtk.get_filter_caps();
+  assert.strictEqual(after.testFailuresMax, 3);
+  assert.strictEqual(after.longLineMax, 500);
+  assert.notStrictEqual(after.spillThreshold, 0, 'invalid cap must be ignored');
+  rtk.set_filter_caps({ testFailuresMax: before.testFailuresMax, longLineMax: before.longLineMax, spillThreshold: before.spillThreshold });
+});
+
 test('spill spills large text to disk', () => {
   const largeText = 'x'.repeat(20000);
   const result = spill.spillIfNeeded(largeText, {

@@ -57,7 +57,17 @@ export function readJson<T = any>(p: string, fallback: T | null = null): T | nul
 
 export function writeJson(p: string, data: unknown, indent = 2): void {
   fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(p, JSON.stringify(data, null, indent) + '\n', 'utf-8');
+  const body = JSON.stringify(data, null, indent) + '\n';
+  const tmp = p + '.tmp';
+  try {
+    fs.writeFileSync(tmp, body, 'utf-8');
+    fs.renameSync(tmp, p);
+  } catch {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {}
+    fs.writeFileSync(p, body, 'utf-8');
+  }
 }
 
 export function round1(n: number): number {

@@ -3,13 +3,11 @@ import * as insights from '../core/insights.js';
 import * as models from '../core/models.js';
 import * as proxy from '../core/proxy.js';
 import * as rtk from '../core/filters/rtk.js';
-import * as translate from '../core/translate.js';
-import * as prompts from '../core/prompts.js';
-import * as todo from '../core/todo.js';
-import * as goals from '../core/goals.js';
-import * as reminders from '../core/reminders.js';
 import * as tokens from '../core/tokens.js';
 import * as budget from '../core/budget.js';
+import { readSpill, resolveSpillFile, cleanSpills, DEFAULT_SPILL_CONFIG, spillIdToPath } from '../core/spill.js';
+import fs from 'node:fs';
+import path from 'node:path';
 import { fmt } from '../tui/components.js';
 import { BANNER, APP_NAME } from '../banner.js';
 
@@ -30,11 +28,12 @@ COMMANDS
   rtk auto <text>                   auto-detect filter and compress text
   proxy status                      show proxy status
   proxy start [--port N]            start the compression proxy
-  proxy stop                        stop the proxy
+  proxy stop                        stop the proxy (restores direct URLs)
   proxy proxify [--port N]          auto-add all configured providers to the proxy
   proxy enable [--port N]           enable auto-start
   proxy disable                     disable auto-start
   proxy test                        test proxy health + upstream forward
+proxy restore                     restore direct provider URLs (use if the proxy died and opencode is stuck)
   accounts list                     list proxy accounts
   accounts add --provider P [--key K] [--base-url U] [--priority N]
   models fetch                      fetch the models.dev catalog (updates cache/snapshot)
@@ -48,32 +47,15 @@ COMMANDS
   models apply --main M [--small S] write main/small model to opencode.jsonc
   settings get                      current config, compaction, backups
   settings save --model M [--small-model S]
-  translate detect '<json body>'    detect the request format
-  translate convert <from> <to> '<json body>'
-  caveman inject [--level lite|full|ultra] '<json body>'
-  ponytail inject [--level lite|full|ultra] '<json body>'
-  todo add <text>                     add a new todo item
-  todo list                          list all todo items
-  todo done <id>                     mark a todo as done
-  todo cancel <id>                   cancel a todo
-  todo remove <id>                   remove a todo
-  todo clear                         clear all done todos
-  goal add <text>                    add a new goal
-  goal list                          list all goals
-  goal done <id>                     mark a goal as completed
-  goal abandon <id>                  abandon a goal
-  goal remove <id>                   remove a goal
-  goal clear                         clear all completed goals
-  remind add <minutes> <text>        add a reminder in N minutes
-  remind list                        list all reminders
-  remind due                         show due reminders
-  remind remove <id>                 remove a reminder
-  remind clear                       clear all fired reminders
   tokens info                        tokenizer info (tiktoken vs heuristic)
   tokens count <text>                count tokens (accurate vs heuristic)
   tokens estimate '<json>'           estimate tokens for a request body (accurate)
   budget status                      daily spend vs budget + enforcement guard
   budget reset                       reset daily budget counters
+  doctor [--fix]                     health check (quota/budget/proxy/tokenizer/model) — --fix clears stale rate_limits
+  recall <id|path> [--head N]        print a spilled tool output in full (proxy spills >16KB to ~/.config/opencode/spill)
+  recall --list [--max N]            list recent spill files (default 20)
+  recall --clean [--older-than H]    delete spill files older than N hours (default 24h)
 `;
 
 function out(line = ''): void {
@@ -285,6 +267,64 @@ async function cmdRtkAuto(args: string[]): Promise<number> {
   return 0;
 }
 
+async function cmdRecall(args: string[]): Promise<number> {
+  const { positionals, flags, bools } = parseFlags(args);
+
+  if (bools.has('list')) {
+    const max = Number(flags.max || 20);
+    const dir = DEFAULT_SPILL_CONFIG.spillDir;
+    if (!fs.existsSync(dir)) {
+      out('  No spills yet.');
+      return 0;
+    }
+    const files = fs.readdirSync(dir)
+      .filter((f) => f.startsWith('spill-') && f.endsWith('.txt'))
+      .map((f) => ({ f, m: fs.statSync(path.join(dir, f)).mtimeMs }))
+      .sort((a, b) => b.m - a.m)
+      .slice(0, max);
+    if (!files.length) {
+      out('  No spills yet.');
+      return 0;
+    }
+    out(`  ${files.length} spill file(s) in ${dir}:`);
+    for (const { f, m } of files) {
+      out(`  ${f}  (${new Date(m).toISOString()})`);
+    }
+    return 0;
+  }
+
+  if (bools.has('clean')) {
+    const hours = Number(flags['older-than'] || 24);
+    const cleaned = cleanSpills(hours * 60 * 60 * 1000);
+    out(`  Removed ${cleaned} spill file(s) older than ${hours}h.`);
+    return 0;
+  }
+
+  const target = positionals.join(' ');
+  if (!target) {
+    outErr('usage: recall <spillId|path>   (try: recall --list)');
+    return 1;
+  }
+  const resolved = resolveSpillFile(target);
+  if (!resolved) {
+    outErr(`No spill found for '${target}' — expected ${spillIdToPath(target)}`);
+    return 1;
+  }
+  const content = readSpill(resolved);
+  if (content === null) {
+    outErr(`Could not read spill file: ${resolved}`);
+    return 1;
+  }
+  const head = Number(flags.head || 0);
+  if (head > 0) {
+    out(content.split('\n').slice(0, head).join('\n'));
+    out(`\n... (${content.split('\n').length} lines total in ${resolved})`);
+    return 0;
+  }
+  out(content);
+  return 0;
+}
+
 async function cmdProxy(args: string[]): Promise<number> {
   const { positionals, flags, bools } = parseFlags(args);
   const sub = positionals[0] || 'status';
@@ -314,6 +354,16 @@ async function cmdProxy(args: string[]): Promise<number> {
     case 'stop': {
       const s = await proxy.stop();
       out(`Proxy stopped. running=${s.running}`);
+      return 0;
+    }
+    case 'restore': {
+      const restored = proxy.restoreDirectUrls();
+      if (restored.length) {
+        out(`Restored direct URLs for: ${restored.join(', ')}`);
+        out('opencode will now work without the proxy. Restart it if currently running.');
+      } else {
+        out('Nothing to restore — no provider points at the proxy.');
+      }
       return 0;
     }
     case 'proxify': {
@@ -523,217 +573,6 @@ async function cmdSettings(args: string[]): Promise<number> {
   return 1;
 }
 
-async function cmdTranslate(args: string[]): Promise<number> {
-  const { positionals } = parseFlags(args);
-  const sub = positionals[0];
-  if (sub === 'detect') {
-    const body = JSON.parse(positionals[1] || '{}');
-    out(`format: ${translate.detect_format(body)}`);
-    return 0;
-  }
-  if (sub === 'convert') {
-    const [, from, to, raw] = positionals;
-    if (!from || !to || raw === undefined) {
-      outErr('usage: translate convert <from> <to> "<json body>"');
-      return 1;
-    }
-    const body = JSON.parse(raw);
-    const result = translate.translate_request(from, to, body);
-    out(JSON.stringify(result, null, 2));
-    return 0;
-  }
-  outErr('usage: translate detect|convert');
-  return 1;
-}
-
-async function cmdInject(args: string[], kind: 'caveman' | 'ponytail'): Promise<number> {
-  const { positionals, flags } = parseFlags(args);
-  const level = flags.level || 'lite';
-  const raw = positionals.join(' ');
-  if (!raw) {
-    outErr(`usage: ${kind} inject [--level lite|full|ultra] "<json body>"`);
-    return 1;
-  }
-  const body = JSON.parse(raw);
-  if (kind === 'caveman') prompts.inject_caveman(body, level);
-  else prompts.inject_ponytail(body, level);
-  out(JSON.stringify(body, null, 2));
-  return 0;
-}
-
-function cmdTodo(args: string[]): number {
-  const { positionals } = parseFlags(args);
-  const sub = positionals[0];
-  const rest = positionals.slice(1);
-
-  switch (sub) {
-    case 'add': {
-      const text = rest.join(' ');
-      if (!text) { outErr('usage: todo add <text>'); return 1; }
-      const item = todo.addTodo(text);
-      out(`+ ${item.id}  ${item.text}`);
-      return 0;
-    }
-    case 'list': {
-      const store = todo.loadTodo();
-      if (!store.items.length) { out('No todos.'); return 0; }
-      printTable(['ID', 'Status', 'Task', 'Created'], store.items.map((i) => [
-        i.id,
-        i.status,
-        i.text,
-        new Date(i.created).toLocaleString(),
-      ]));
-      return 0;
-    }
-    case 'done': {
-      const id = rest[0];
-      if (!id) { outErr('usage: todo done <id>'); return 1; }
-      const item = todo.completeTodo(id);
-      if (!item) { outErr(`Todo ${id} not found.`); return 1; }
-      out(`\u2713 ${item.id}  ${item.text}`);
-      return 0;
-    }
-    case 'cancel': {
-      const id = rest[0];
-      if (!id) { outErr('usage: todo cancel <id>'); return 1; }
-      const item = todo.cancelTodo(id);
-      if (!item) { outErr(`Todo ${id} not found.`); return 1; }
-      out(`\u2717 ${item.id}  ${item.text}`);
-      return 0;
-    }
-    case 'remove': {
-      const id = rest[0];
-      if (!id) { outErr('usage: todo remove <id>'); return 1; }
-      const ok = todo.removeTodo(id);
-      if (!ok) { outErr(`Todo ${id} not found.`); return 1; }
-      out(`Removed ${id}.`);
-      return 0;
-    }
-    case 'clear': {
-      const n = todo.clearDoneTodos();
-      out(`Cleared ${n} done item(s).`);
-      return 0;
-    }
-    default:
-      outErr('usage: todo add|list|done|cancel|remove|clear');
-      return 1;
-  }
-}
-
-function cmdGoals(args: string[]): number {
-  const { positionals } = parseFlags(args);
-  const sub = positionals[0];
-  const rest = positionals.slice(1);
-
-  switch (sub) {
-    case 'add': {
-      const text = rest.join(' ');
-      if (!text) { outErr('usage: goal add <text>'); return 1; }
-      const g = goals.addGoal(text);
-      out(`+ ${g.id}  ${g.text}`);
-      return 0;
-    }
-    case 'list': {
-      const store = goals.loadGoals();
-      if (!store.goals.length) { out('No goals.'); return 0; }
-      printTable(['ID', 'Status', 'Goal', 'Created'], store.goals.map((g) => [
-        g.id,
-        g.status,
-        g.text,
-        new Date(g.created).toLocaleString(),
-      ]));
-      return 0;
-    }
-    case 'done': {
-      const id = rest[0];
-      if (!id) { outErr('usage: goal done <id>'); return 1; }
-      const g = goals.completeGoal(id);
-      if (!g) { outErr(`Goal ${id} not found.`); return 1; }
-      out(`\u2713 ${g.id}  ${g.text}`);
-      return 0;
-    }
-    case 'abandon': {
-      const id = rest[0];
-      if (!id) { outErr('usage: goal abandon <id>'); return 1; }
-      const g = goals.abandonGoal(id);
-      if (!g) { outErr(`Goal ${id} not found.`); return 1; }
-      out(`\u2717 ${g.id}  ${g.text}`);
-      return 0;
-    }
-    case 'remove': {
-      const id = rest[0];
-      if (!id) { outErr('usage: goal remove <id>'); return 1; }
-      const ok = goals.removeGoal(id);
-      if (!ok) { outErr(`Goal ${id} not found.`); return 1; }
-      out(`Removed ${id}.`);
-      return 0;
-    }
-    case 'clear': {
-      const n = goals.clearCompletedGoals();
-      out(`Cleared ${n} completed goal(s).`);
-      return 0;
-    }
-    default:
-      outErr('usage: goal add|list|done|abandon|remove|clear');
-      return 1;
-  }
-}
-
-function cmdRemind(args: string[]): number {
-  const { positionals } = parseFlags(args);
-  const sub = positionals[0];
-  const rest = positionals.slice(1);
-
-  switch (sub) {
-    case 'add': {
-      const mins = parseInt(rest[0], 10);
-      const text = rest.slice(1).join(' ');
-      if (!mins || mins <= 0 || !text) { outErr('usage: remind add <minutes> <text>'); return 1; }
-      const dueAt = new Date(Date.now() + mins * 60 * 1000);
-      const r = reminders.addReminder(text, dueAt);
-      out(`+ ${r.id}  "${r.text}" due ${dueAt.toLocaleString()}`);
-      return 0;
-    }
-    case 'list': {
-      const store = reminders.loadReminders();
-      if (!store.reminders.length) { out('No reminders.'); return 0; }
-      printTable(['ID', 'Text', 'Due', 'Fired'], store.reminders.map((r) => [
-        r.id,
-        r.text,
-        new Date(r.dueAt).toLocaleString(),
-        r.fired ? 'yes' : 'no',
-      ]));
-      return 0;
-    }
-    case 'due': {
-      const due = reminders.getDueReminders();
-      if (!due.length) { out('No due reminders.'); return 0; }
-      printTable(['ID', 'Text', 'Due'], due.map((r) => [
-        r.id,
-        r.text,
-        new Date(r.dueAt).toLocaleString(),
-      ]));
-      return 0;
-    }
-    case 'remove': {
-      const id = rest[0];
-      if (!id) { outErr('usage: remind remove <id>'); return 1; }
-      const ok = reminders.removeReminder(id);
-      if (!ok) { outErr(`Reminder ${id} not found.`); return 1; }
-      out(`Removed ${id}.`);
-      return 0;
-    }
-    case 'clear': {
-      const n = reminders.clearFiredReminders();
-      out(`Cleared ${n} fired reminder(s).`);
-      return 0;
-    }
-    default:
-      outErr('usage: remind add|list|due|remove|clear');
-      return 1;
-  }
-}
-
 function cmdTokens(args: string[]): number {
   const { positionals } = parseFlags(args);
   const sub = positionals[0] || 'info';
@@ -800,6 +639,40 @@ function cmdBudget(args: string[]): number {
   }
 }
 
+function cmdDoctor(args: string[]): number {
+  const { bools } = parseFlags(args);
+  const fix = bools.has('fix');
+  const d = insights.doctorSummary({ fix }) as Record<string, any>;
+  out(BANNER.trimEnd());
+  out(`Doctor — ${d.ok ? 'OK' : `${d.issues.length} issue(s)`}${fix ? ' (fix applied where safe)' : ''}`);
+  out(`Model: ${d.currentModel || '—'}  Tokenizer: ${d.tokenizer.available ? `✓ ${d.tokenizer.encoding}` : '⚠ heuristic'}`);
+  out(`Proxy: ${d.proxy.enabled ? `enabled :${d.proxy.port} proxied=${(d.proxy.proxied_providers||[]).join(',')||'—'}` : 'disabled'}`);
+  out(`Budget: ${d.budgetStatus ? `${(d.budgetStatus as any).spentTokens} tok today / ${(d.budgetStatus as any).policy.free_daily_token_limit} limit — ${(d.budgetStatus as any).exceeded ? 'EXCEEDED' : 'ok'}` : '—'}`);
+  out();
+  if (d.issues.length) {
+    out('Issues:');
+    for (const iss of d.issues) out(`  - ${iss}`);
+    out();
+  } else {
+    out('No issues.');
+    out();
+  }
+  if (d.fixes.length) {
+    out('Fixes:');
+    for (const f of d.fixes) out(`  * ${f}`);
+    out();
+  }
+  if (!fix && d.issues.some((i: string) => i.includes('stale rate_limit'))) {
+    out('Hint: run `token-saver doctor --fix` to clear only expired rate_limits (safe).');
+    out('Auto-clear is GOOD for stale TTLs (rate_limited_until < now) — bad for 401 auth failures inside window (hides real bad key).');
+  }
+  if (d.budgetStatus?.exceeded) {
+    out('Budget exceeded — daily tokens exceed free limit; proxy forces fallback and can cause 401 if fallback also rate-limited.');
+    out('  fix: `token-saver budget reset` or `token-saver models policy set --free-limit 5000000` or set TOKENSAVER_BUDGET_ENFORCE=0 to bypass.');
+  }
+  return d.ok ? 0 : 1;
+}
+
 export async function runCommand(argv: string[]): Promise<number> {
   if (!argv.length || argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') {
     out(HELP);
@@ -839,22 +712,14 @@ export async function runCommand(argv: string[]): Promise<number> {
       return cmdModels(rest);
     case 'settings':
       return cmdSettings(rest);
-    case 'translate':
-      return cmdTranslate(rest);
-    case 'caveman':
-      return cmdInject(rest, 'caveman');
-    case 'ponytail':
-      return cmdInject(rest, 'ponytail');
-    case 'todo':
-      return cmdTodo(rest);
-    case 'goal':
-      return cmdGoals(rest);
-    case 'remind':
-      return cmdRemind(rest);
     case 'tokens':
       return cmdTokens(rest);
     case 'budget':
       return cmdBudget(rest);
+    case 'doctor':
+      return cmdDoctor(rest);
+    case 'recall':
+      return cmdRecall(rest);
     default:
       outErr(`Unknown command: ${cmd}`);
       outErr(`Run "token-saver help" for usage.`);

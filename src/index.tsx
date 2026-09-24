@@ -4,6 +4,8 @@ import App from './tui/App.js';
 import { runCommand } from './cli/commands.js';
 import { TS_VERSION } from './core/config.js';
 import { APP_NAME } from './banner.js';
+import * as proxy from './core/proxy.js';
+import * as insights from './core/insights.js';
 
 function parseArgv(argv: string[]): { command: string[]; wantsTui: boolean } {
   const command: string[] = [];
@@ -28,7 +30,18 @@ async function main() {
       console.log(`${APP_NAME} CLI v${TS_VERSION} — the TUI needs an interactive terminal. Run "token-saver help" for CLI commands.`);
       return;
     }
-    render(<App />);
+    // Auto-clear expired rate limits and auto-start proxy if enabled
+    try {
+      insights.doctorSummary({ fix: true });
+      const proxyCfg = proxy.loadConfig();
+      if (proxyCfg.enabled !== false) {
+        await proxy.start(proxyCfg.port).catch(() => {});
+      }
+    } catch {}
+
+    const appInstance = render(<App onExit={() => {
+      proxy.stop().finally(() => process.exit(0));
+    }} />);
     return;
   }
   if (!command.length && isPiped) {

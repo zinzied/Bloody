@@ -8,6 +8,7 @@
     "token-saver": "dist/index.js"
   },
   "license": "MIT",
+  "workspaces": ["apps/*"],
   "scripts": {
     "start": "tsx src/index.tsx",
     "dev": "tsx src/index.tsx",

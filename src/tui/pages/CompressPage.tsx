@@ -1,6 +1,6 @@
 import React, { useState, useMemo } from 'react';
 import { Box, Text } from 'ink';
-import { Page, Row, Stat, Hint, ErrorLine, TextField, Badge, fmt } from '../components.js';
+import { Page, Row, Stat, Hint, ErrorLine, TextField, Badge, fmt, Spinner } from '../components.js';
 import { useScreenInput } from '../input.js';
 import { compressTest } from '../../core/insights.js';
 import * as rtk from '../../core/filters/rtk.js';
@@ -47,6 +47,7 @@ export function CompressPage() {
   const [error, setError] = useState('');
   const [editing, setEditing] = useState(false);
   const [fileMode, setFileMode] = useState(false);
+  const [loading, setLoading] = useState(false);
   const [filePath, setFilePath] = useState('');
   const [filterIdx, setFilterIdx] = useState(0); // 0=auto
   const [tokenMode, setTokenMode] = useState<'accurate' | 'heuristic' | 'both'>('both');
@@ -55,6 +56,7 @@ export function CompressPage() {
 
   const run = (overrideText?: string, overrideFilter?: string) => {
     setError('');
+    setLoading(true);
     const src = overrideText ?? text;
     const fname = overrideFilter ?? filterName;
     try {
@@ -92,6 +94,7 @@ export function CompressPage() {
     }
     setEditing(false);
     setFileMode(false);
+    setLoading(false);
   };
 
   useScreenInput((k) => {
@@ -148,8 +151,9 @@ export function CompressPage() {
   return (
     <Page title="Compress — Playground" sub="Split-pane RTK compression lab with accurate tiktoken counts and budget-aware cost estimates.">
       {error && <ErrorLine>{error}</ErrorLine>}
+      {loading && <Spinner label="Compressing…" />}
 
-      {!editing && !fileMode && (
+      {!editing && !fileMode && !loading && (
         <Hint>
           e: enter text · o: load file · l: demo sample · f: filter ({filterName}) · t: tokens ({tokenMode}) · r:
           rerun · c: clear · s: load large diff

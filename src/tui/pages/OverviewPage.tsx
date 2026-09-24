@@ -1,6 +1,6 @@
 import React from 'react';
 import { Box, Text } from 'ink';
-import { Page, Row, Stat, Hint, ErrorLine, fmt } from '../components.js';
+import { Page, Row, Stat, Hint, ErrorLine, fmt, Meter } from '../components.js';
 import { useData } from '../useData.js';
 import { usageSummary } from '../../core/insights.js';
 import { BANNER, APP_NAME } from '../../banner.js';
@@ -16,12 +16,17 @@ export function OverviewPage() {
       </Box>
       {error && <ErrorLine>{error}</ErrorLine>}
       {p && (
-        <Row>
-          <Stat label="Ledger entries" value={fmt(p.ledger.entries)} />
-          <Stat label="Ledger tokens saved" value={fmt(p.ledger.saved_tokens)} />
-          <Stat label="Proxy requests" value={fmt(p.proxy.requests)} />
-          <Stat label="Proxy tokens saved" value={fmt(p.proxy.saved_tokens)} />
-        </Row>
+        <>
+          <Row>
+            <Stat label="Ledger entries" value={fmt(p.ledger.entries)} />
+            <Stat label="Ledger tokens saved" value={fmt(p.ledger.saved_tokens)} />
+            <Stat label="Proxy requests" value={fmt(p.proxy.requests)} />
+            <Stat label="Proxy tokens saved" value={fmt(p.proxy.saved_tokens)} />
+          </Row>
+          <Row>
+            <Meter value={p.proxy.saved_tokens || 0} max={p.proxy.saved_tokens + (p.ledger.saved_tokens || 1)} label="Token savings" cols={30} suffix="of total" />
+          </Row>
+        </>
       )}
       <Hint>
         Pick a page from the sidebar (Up/Down to move, q to quit): Usage, Quota, Compress, Proxy, Routing,

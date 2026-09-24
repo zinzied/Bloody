@@ -99,6 +99,19 @@ test('parse_rate_limit_headers handles openai and anthropic formats', () => {
   assert.strictEqual(parse_rate_limit_headers({ 'content-type': 'application/json' }), null);
 });
 
+test('is_rate_limited picks up external quota file changes without restart', () => {
+  const qt = new QuotaTracker();
+  qt.clear_rate_limit('groq');
+  assert.strictEqual(qt.is_rate_limited('groq'), false);
+  const raw = JSON.parse(fs.readFileSync(qt.dataFile, 'utf8'));
+  raw.providers.groq = raw.providers.groq || {};
+  raw.providers.groq.rate_limited_until = new Date(Date.now() + 60000).toISOString();
+  fs.writeFileSync(qt.dataFile, JSON.stringify(raw));
+  assert.strictEqual(qt.is_rate_limited('groq'), true, 'external writes must be visible without a restart');
+  qt.clear_rate_limit('groq');
+  assert.strictEqual(qt.is_rate_limited('groq'), false);
+});
+
 test('quota file uses exactly the same schema as python quota_tracker.json', () => {
   const qt = new QuotaTracker();
   qt.update_quota('mistral', 'mistral-large', { remaining: 500, account_id: 'a9' });

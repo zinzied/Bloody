@@ -179,6 +179,70 @@ test('proxy retries with original body when upstream returns 400', async () => {
   }
 });
 
+test('proxy reroutes to a healthy provider after the first returns 429', async () => {
+  const dead: string[] = [];
+  const healthy: { model: string | null; auth: string | null } = { model: null, auth: null };
+  const deadMock = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      dead.push(req.url || '');
+      res.writeHead(429, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'FreeUsageLimitError', message: 'rate limit exceeded' } }));
+    });
+  });
+  const healthyMock = http.createServer((req, res) => {
+    let chunks = '';
+    req.on('data', (c: string) => (chunks += c));
+    req.on('end', () => {
+      healthy.model = JSON.parse(chunks).model;
+      healthy.auth = req.headers['authorization'] || null;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ id: 'fb', object: 'chat.completion', choices: [{ message: { role: 'assistant', content: 'ok' } }] }));
+    });
+  });
+  const deadPort = await listen(deadMock);
+  const healthyPort = await listen(healthyMock);
+  process.env.ZAI_API_KEY = 'test-zai-key';
+  const cfgDir = path.join(TMP, '.config', 'opencode');
+  fs.mkdirSync(cfgDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(cfgDir, 'opencode.jsonc'),
+    JSON.stringify({ model: 'zai/glm-4.5-flash', small_model: 'zai/glm-4.5-flash' }),
+    'utf-8'
+  );
+  proxy.saveConfig({
+    port: 0,
+    enabled: false,
+    proxied_providers: ['openai', 'zai'],
+    saved_base_urls: {
+      openai: `http://127.0.0.1:${deadPort}/v1`,
+      zai: `http://127.0.0.1:${healthyPort}/v1`,
+    },
+  });
+  const body = JSON.stringify({ model: 'openai/gpt-4o', messages: [{ role: 'user', content: 'hi' }] });
+
+  await proxy.start(0);
+  try {
+    const s1 = await post(proxy.status().port!, '/v1/chat/completions', body);
+    assert.strictEqual(s1.status, 429);
+    assert.strictEqual(dead.length, 1, 'first request must hit the dead upstream');
+
+    const s2 = await post(proxy.status().port!, '/v1/chat/completions', body);
+    assert.strictEqual(s2.status, 200);
+    assert.strictEqual(healthy.model, 'glm-4.5-flash', 'rerouted request must carry the fallback model');
+    assert.strictEqual(healthy.auth, 'Bearer test-zai-key', 'rerouted request must swap to the fallback credential');
+    assert.strictEqual(dead.length, 1, 'no further traffic must reach the dead upstream');
+  } finally {
+    await proxy.stop();
+    deadMock.close();
+    healthyMock.close();
+    delete process.env.ZAI_API_KEY;
+    try {
+      fs.unlinkSync(path.join(cfgDir, 'opencode.jsonc'));
+    } catch {}
+  }
+});
+
 test('testConnection reports health and upstream forwarding', async () => {
   const mock = http.createServer((req, res) => {
     if (req.method === 'GET' && req.url === '/v1/models') {

@@ -1,6 +1,6 @@
 import React from 'react';
 import { Box, Text } from 'ink';
-import { Page, Section, Row, Stat, Table, Hint, ErrorLine, Badge, fmt, countdown, T } from '../components.js';
+import { Page, Section, Row, Stat, Table, Hint, ErrorLine, Badge, fmt, countdown, T, Meter, Spinner } from '../components.js';
 import { useData } from '../useData.js';
 import { quotaSummary } from '../../core/insights.js';
 
@@ -16,7 +16,7 @@ export function QuotaPage() {
   return (
     <Page title="Quota" sub="Provider quota tracker and per-task budget (live — refreshes every 3s).">
       {error && <ErrorLine>{error}</ErrorLine>}
-      {!data && !error && <Hint>Loading…</Hint>}
+      {!data && !error && <Spinner label="Loading quota…" />}
       {data && (
         <>
           {/* Daily budget enforcement (new) */}
@@ -43,6 +43,15 @@ export function QuotaPage() {
                     label="Free tokens left"
                     value={fmt((budgetStatus as any).remainingTokens)}
                     sub={`limit ${fmt((budgetStatus as any).policy?.free_daily_token_limit)}`}
+                  />
+                </Row>
+                <Row>
+                  <Meter
+                    value={Number((budgetStatus as any).spentUSD ?? 0)}
+                    max={Number((budgetStatus.policy as any)?.daily_budget_usd ?? 1)}
+                    label="Budget utilization"
+                    cols={35}
+                    suffix="of daily"
                   />
                 </Row>
                 <Box marginTop={1} flexDirection="row">
@@ -73,6 +82,15 @@ export function QuotaPage() {
                 <Stat
                   label="Remaining"
                   value={`${fmt(budget.remaining)} ${budget.remaining > 0 ? '' : '(used up)'}`}
+                />
+              </Row>
+              <Row>
+                <Meter
+                  value={Number(budget.total_allocated ?? 0)}
+                  max={Number(budget.budget_limit ?? 1)}
+                  label="Task budget allocated"
+                  cols={35}
+                  suffix="of limit"
                 />
               </Row>
               <Section title="Allocation">

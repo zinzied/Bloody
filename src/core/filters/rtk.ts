@@ -1,4 +1,5 @@
 import type { CompressStats, FilterFn, RequestBody } from '../types.js';
+import { spillIfNeeded as _spillIfNeeded, DEFAULT_SPILL_CONFIG as _SPILL_CONFIG } from '../spill.js';
 
 export const RAW_CAP = 10 * 1024 * 1024;
 export const MIN_COMPRESS_SIZE = 500;
@@ -32,6 +33,39 @@ export const TOOL_RESULT_PRUNE_THRESHOLD = 8192;
 export const TOOL_RESULT_PRUNE_HEAD = 4096;
 export const TOOL_RESULT_PRUNE_TAIL = 1024;
 export const TOOL_RESULT_PRUNE_MARKER = '\n\n[... tool result middle pruned ...]\n\n';
+
+export const TEST_FAILURES_MAX = 8;
+export const TEST_ERR_LINES_MAX = 3;
+export const LONG_LINE_MAX = 1000;
+export const SPILL_THRESHOLD = 16 * 1024;
+
+export interface FilterCaps {
+  testFailuresMax: number;
+  testErrLinesMax: number;
+  longLineMax: number;
+  spillThreshold: number;
+  [key: string]: number | undefined;
+}
+
+let _caps: FilterCaps = {
+  testFailuresMax: TEST_FAILURES_MAX,
+  testErrLinesMax: TEST_ERR_LINES_MAX,
+  longLineMax: LONG_LINE_MAX,
+  spillThreshold: SPILL_THRESHOLD,
+};
+
+export function set_filter_caps(partial: Partial<FilterCaps> | undefined | null): void {
+  if (!partial) return;
+  const next = { ..._caps };
+  for (const [k, v] of Object.entries(partial)) {
+    if (typeof v === 'number' && Number.isFinite(v) && v > 0) next[k as keyof FilterCaps] = v;
+  }
+  _caps = next;
+}
+
+export function get_filter_caps(): FilterCaps {
+  return { ..._caps };
+}
 
 const RE_GIT_DIFF = /^diff --git /m;
 const RE_GIT_DIFF_HUNK = /^@@ /m;
@@ -713,6 +747,295 @@ export function build_output(inputText: string): string {
   return result || inputText;
 }
 
+const RE_PYTEST_SESSION = /^=+ test session starts =+$/m;
+const RE_PYTEST_FAILURES = /^=+ FAILURES =+$/m;
+const RE_PYTEST_SHORT_SUMMARY = /^=+ short test summary info =+$/m;
+const RE_GO_TEST_RESULT = /^(ok|FAIL)\s+(\S+)/m;
+const RE_GO_TEST_FAIL = /^--- FAIL: (\S+)/m;
+const RE_JS_TEST_COUNTERS = /^\s*Tests\s+(?:\d+ failed\s*\|\s*)?\d+ passed/m;
+const RE_JEST_COUNTERS = /^\s*Tests:\s+(?:\d+ failed,\s*)?\d+ passed/m;
+
+function _strip_ansi(text: string): string {
+  return text
+    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
+    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
+}
+
+function _parse_pytest_summary(summary: string): Record<'passed' | 'failed' | 'skipped' | 'xfailed' | 'xpassed', number> {
+  const counts = { passed: 0, failed: 0, skipped: 0, xfailed: 0, xpassed: 0 };
+  if (!summary) return counts;
+  for (const part of summary.split(',')) {
+    const words = part.trim().split(/\s+/);
+    for (let i = 1; i < words.length; i++) {
+      const n = parseInt(words[i - 1], 10);
+      if (Number.isNaN(n)) continue;
+      if (words[i].includes('xpassed')) counts.xpassed = n;
+      else if (words[i].includes('xfailed')) counts.xfailed = n;
+      else if (words[i].includes('passed')) counts.passed = n;
+      else if (words[i].includes('failed')) counts.failed = n;
+      else if (words[i].includes('skipped')) counts.skipped = n;
+    }
+  }
+  return counts;
+}
+
+function _fmt_pytest(text: string): string {
+  const lines = text.split('\n');
+  let sawSession = false;
+  let summary = '';
+  const failures: string[][] = [];
+  const failedSummary: string[] = [];
+  const xfail: string[] = [];
+  let cur: string[] | null = null;
+
+  const flush = () => {
+    if (cur && cur.length) failures.push(cur);
+    cur = null;
+  };
+
+  for (const raw of lines) {
+    const t = raw.trim();
+    if (RE_PYTEST_SESSION.test(t)) {
+      sawSession = true;
+      continue;
+    }
+    if (RE_PYTEST_FAILURES.test(t)) {
+      flush();
+      cur = [];
+      continue;
+    }
+    if (RE_PYTEST_SHORT_SUMMARY.test(t)) {
+      flush();
+      cur = null;
+      continue;
+    }
+    if (t.startsWith('___') && t.endsWith('___') && t.length > 8) {
+      flush();
+      cur = [raw];
+      continue;
+    }
+    if (cur) {
+      cur.push(raw);
+      continue;
+    }
+    if (/^FAILED |^ERROR /.test(t)) {
+      failedSummary.push(t);
+      continue;
+    }
+    if (/^XFAIL |^XPASS /.test(t)) {
+      xfail.push(t);
+      continue;
+    }
+    if (!summary && /passed|failed|skipped|xfailed|xpassed/.test(t) && /( in \d+\.\d+s|\d+\.\d+s)\s*=*$/i.test(t)) {
+      summary = t;
+      continue;
+    }
+  }
+  flush();
+
+  if (!sawSession) return text;
+
+  const counts = _parse_pytest_summary(summary);
+  const total = counts.passed + counts.failed + counts.skipped + counts.xfailed + counts.xpassed;
+  if (total === 0 && !failedSummary.length && !failures.length) {
+    return 'pytest: no tests collected';
+  }
+
+  const failedCount = counts.failed || failedSummary.length || failures.length;
+  const parts = [`${counts.passed} passed`];
+  if (failedCount > 0) parts.push(`${failedCount} failed`);
+  if (counts.skipped > 0) parts.push(`${counts.skipped} skipped`);
+  if (counts.xfailed > 0) parts.push(`${counts.xfailed} xfailed`);
+  if (counts.xpassed > 0) parts.push(`${counts.xpassed} xpassed`);
+  let out = `pytest: ${parts.join(', ')}`;
+
+  if (xfail.length) {
+    out += `\nExpected-failure outcomes:`;
+    for (const x of xfail.slice(0, 6)) out += `\n  ${x.slice(0, 120)}`;
+    if (xfail.length > 6) out += `\n  ... +${xfail.length - 6} more`;
+  }
+
+  const failItems = [...failures, ...failedSummary];
+  if (failItems.length) {
+    out += `\nFailures:`;
+    for (let i = 0; i < Math.min(failItems.length, _caps.testFailuresMax); i++) {
+      const item = failItems[i];
+      const block = Array.isArray(item) ? item : [item];
+      const firstTrim = (block[0] || '').trim();
+      let title = '';
+      const under = /^_{3,}\s*(.*?)\s*_{3,}$/.exec(firstTrim);
+      if (under) {
+        title = under[1].trim();
+      } else if (/^FAILED /.test(firstTrim)) {
+        title = (firstTrim.replace(/^FAILED /, '').split(' - ')[0] || '').trim();
+      } else {
+        title = firstTrim;
+      }
+      out += `\n${i + 1}. [FAIL] ${title || 'unknown'}\n`;
+      let errShown = 0;
+      for (const line of block.slice(1)) {
+        const lt = line.trim();
+        if (!lt) continue;
+        const relevant = lt.startsWith('>') || lt.startsWith('E ') || /assert|error|\.py:\d+/.test(lt);
+        if (relevant && errShown < _caps.testErrLinesMax) {
+          out += `     ${lt.slice(0, 100)}\n`;
+          errShown += 1;
+        }
+      }
+    }
+    if (failItems.length > _caps.testFailuresMax) {
+      out += `... +${failItems.length - _caps.testFailuresMax} more failures`;
+    }
+  }
+
+  const result = out.replace(/\n+$/, '');
+  return result || text;
+}
+
+function _fmt_go_test(text: string): string {
+  const lines = text.split('\n');
+  let sawMark = false;
+  const results: { pkg: string; ok: boolean }[] = [];
+  const fails: { name: string; body: string[] }[] = [];
+  let curFail: { name: string; body: string[] } | null = null;
+
+  for (const raw of lines) {
+    const t = raw.trim();
+    const res = /^(ok|FAIL)\s+(\S+)/.exec(t);
+    if (res) {
+      sawMark = true;
+      curFail = null;
+      results.push({ pkg: res[2], ok: res[1] === 'ok' });
+      continue;
+    }
+    const failHdr = /^--- FAIL: (\S+)/.exec(t);
+    if (failHdr) {
+      sawMark = true;
+      curFail = { name: failHdr[1], body: [] };
+      fails.push(curFail);
+      continue;
+    }
+    if (curFail) {
+      if (/^--- (PASS|SKIP|FAIL): /.test(t) || /^(PASS|FAIL|ok)\s*$/.test(t) || /^=== RUN /.test(t)) {
+        curFail = null;
+        continue;
+      }
+      if (raw.startsWith('    ') || raw.startsWith('\t') || !raw) curFail.body.push(raw);
+    }
+  }
+  if (!sawMark) return text;
+
+  const okCount = results.filter((r) => r.ok).length;
+  const failCount = results.filter((r) => !r.ok).length;
+  let out = fails.length && !results.length
+    ? `go test: ${fails.length} failed`
+    : `go test: ${okCount} ok, ${failCount} failed`;
+
+  if (fails.length) {
+    out += `\nFailures:`;
+    for (const f of fails.slice(0, _caps.testFailuresMax)) {
+      out += `\n  [FAIL] ${f.name}`;
+      for (const b of f.body.slice(0, _caps.testErrLinesMax)) out += `\n    ${b.trim().slice(0, 100)}`;
+      if (f.body.length > _caps.testErrLinesMax) out += `\n    ... (+${f.body.length - _caps.testErrLinesMax} more)`;
+    }
+    if (fails.length > _caps.testFailuresMax) out += `\n... +${fails.length - _caps.testFailuresMax} more failures`;
+  }
+  return out;
+}
+
+function _fmt_js_test(text: string): string {
+  const isJest = RE_JEST_COUNTERS.test(text) && !RE_JS_TEST_COUNTERS.test(text);
+  const isVitest = RE_JS_TEST_COUNTERS.test(text);
+  if (!isJest && !isVitest) return text;
+
+  let passed = 0;
+  let failed = 0;
+  if (isJest) {
+    const m = /^\s*Tests:\s+([\d,]+)\s+failed,\s*([\d,]+)\s+passed/m.exec(text);
+    if (m) {
+      failed = parseInt(m[1].replace(/,/g, ''), 10) || 0;
+      passed = parseInt(m[2].replace(/,/g, ''), 10) || 0;
+    }
+  } else {
+    const mf = /^\s*Tests\s+([\d,]+)\s+failed\s*\|\s*([\d,]+)\s+passed/m.exec(text);
+    const mp = /^\s*Tests\s+[\d,]+ failed\s*\|\s*([\d,]+)\s+passed/m.exec(text) ||
+      /^\s*Tests\s+([\d,]+)\s+passed/m.exec(text);
+    if (mf) {
+      failed = parseInt(mf[1].replace(/,/g, ''), 10) || 0;
+      passed = parseInt(mf[2].replace(/,/g, ''), 10) || 0;
+    } else if (mp && mp[1]) {
+      passed = parseInt(mp[1].replace(/,/g, ''), 10) || 0;
+    }
+  }
+
+  const failBlocks: string[] = [];
+  let curFail: string[] | null = null;
+  for (const raw of text.split('\n')) {
+    const t = raw.trim();
+    const isStackArrow = t.startsWith('\u276F ') && !t.includes(' > ');
+    if (isStackArrow && curFail) {
+      if (curFail.length < 8) curFail.push(t);
+      continue;
+    }
+    const isFailMarker = t.includes('\u276F') || /^\[x\]/i.test(t) || /^\u2717/.test(t) ||
+      t.startsWith('\u25CF') || (t.startsWith('FAIL ') && t.includes('>')) || t.startsWith(' FAIL ');
+    if (isFailMarker) {
+      if (curFail) failBlocks.push(curFail.join('\n'));
+      curFail = [t];
+      continue;
+    }
+    if (curFail && (t.startsWith('AssertionError') || t.startsWith('Error') ||
+      /expected|received|at |\.test\.(ts|js|tsx|jsx):\d+/.test(t) || !t)) {
+      if (curFail.length < 6) curFail.push(t.slice(0, 120));
+      continue;
+    }
+  }
+  if (curFail) failBlocks.push(curFail.join('\n'));
+
+  const name = isJest ? 'jest' : 'vitest';
+  let out = `${name}: ${passed} passed, ${failed} failed`;
+  if (failed > 0) {
+    const counterLine = text.match(/^Test Files\s+.*$/m);
+    if (counterLine) out += `\n${counterLine[0].trim()}`;
+  }
+  if (failBlocks.length) {
+    out += `\nFailures:`;
+    for (const b of failBlocks.slice(0, _caps.testFailuresMax)) {
+      const bits = b.split('\n');
+      const rawFirst = (bits[0] || '').trim() || 'unknown';
+      const first = (rawFirst.startsWith('FAIL ') ? rawFirst.slice(5) : rawFirst).trim();
+      out += `\n  [FAIL] ${first.slice(0, 120)}`;
+      for (const r of bits.slice(1).filter(Boolean).slice(0, _caps.testErrLinesMax)) {
+        out += `\n      ${r.slice(0, 100)}`;
+      }
+    }
+    if (failBlocks.length > _caps.testFailuresMax) out += `\n... +${failBlocks.length - _caps.testFailuresMax} more failures`;
+  }
+  return out;
+}
+
+export function test_output(inputText: string): string {
+  const clean = _strip_ansi(String(inputText));
+  if (RE_PYTEST_SESSION.test(clean)) return _fmt_pytest(clean);
+  if (RE_GO_TEST_RESULT.test(clean) || RE_GO_TEST_FAIL.test(clean)) return _fmt_go_test(clean);
+  if (RE_JS_TEST_COUNTERS.test(clean) || RE_JEST_COUNTERS.test(clean)) return _fmt_js_test(clean);
+  return inputText;
+}
+
+export function long_lines(inputText: string): string {
+  const cap = _caps.longLineMax;
+  if (cap <= 0) return inputText;
+  let changed = false;
+  const out = inputText.split('\n').map((line) => {
+    if (line.length > cap) {
+      changed = true;
+      return `${line.slice(0, cap)}\u2026`;
+    }
+    return line;
+  });
+  return changed ? out.join('\n') : inputText;
+}
+
 export const FILTER_REGISTRY: Record<string, FilterFn> = {
   'git-diff': git_diff,
   'git-status': git_status,
@@ -726,6 +1049,8 @@ export const FILTER_REGISTRY: Record<string, FilterFn> = {
   'read-numbered': read_numbered,
   'search-list': search_list,
   'build-output': build_output,
+  'test-output': test_output,
+  'long-lines': long_lines,
   'tool-result-prune': tool_result_prune,
 };
 
@@ -738,10 +1063,17 @@ function tool_result_prune(text: string): string {
 
 export function auto_detect_filter(text: string): FilterFn | null {
   const head = text.length > DETECT_WINDOW ? text.slice(0, DETECT_WINDOW) : text;
+  const headClean = _strip_ansi(head);
 
   if (RE_GIT_LOG.test(head)) return git_log;
   if (RE_GIT_DIFF.test(head) || RE_GIT_DIFF_HUNK.test(head)) return git_diff;
   if (RE_GIT_STATUS.test(head)) return git_status;
+
+  if (RE_PYTEST_SESSION.test(headClean)) return test_output;
+  if ((headClean.match(RE_GO_TEST_RESULT) || []).length >= 2 || RE_GO_TEST_FAIL.test(headClean)) {
+    return test_output;
+  }
+  if (RE_JS_TEST_COUNTERS.test(headClean) || RE_JEST_COUNTERS.test(headClean)) return test_output;
 
   if (RE_BUILD_OUTPUT.test(head)) return build_output;
 
@@ -769,7 +1101,19 @@ export function auto_detect_filter(text: string): FilterFn | null {
 
   if (text.length > TOOL_RESULT_PRUNE_THRESHOLD) return tool_result_prune;
 
+  if (_has_long_line(head, _caps.longLineMax)) return long_lines;
+
   return null;
+}
+
+function _has_long_line(text: string, cap: number): boolean {
+  if (cap <= 0) return false;
+  const lines = text.split('\n');
+  const sample = lines.slice(0, 40);
+  for (const l of sample) {
+    if (l.length > cap) return true;
+  }
+  return lines.length > 40 && lines.some((l) => l.length > cap);
 }
 
 function _is_grep_line(line: string): boolean {
@@ -835,32 +1179,47 @@ export function safe_apply(fn: FilterFn | null, text: string): string {
 export function compress_text(text: string, stats: CompressStats): string {
   const bytesIn = text.length;
   stats.bytesBefore += bytesIn;
+  if (bytesIn === 0) return text;
 
-  if (bytesIn < MIN_COMPRESS_SIZE || bytesIn > RAW_CAP) {
-    stats.bytesAfter += bytesIn;
-    return text;
+  const clean = _strip_ansi(text);
+  const ansiSaved = bytesIn - clean.length;
+
+  const spillCandidate = (out: string, outLen: number, shape: string, filter: string): string => {
+    if (outLen < bytesIn) {
+      stats.bytesAfter += outLen;
+      stats.hits.push({ shape, filter, saved: bytesIn - outLen });
+      return out;
+    }
+    return _spill_or_pass(text, clean, ansiSaved, stats);
+  };
+
+  if (bytesIn > RAW_CAP) return _spill_or_pass(text, clean, ansiSaved, stats);
+  if (clean.length < MIN_COMPRESS_SIZE) return spillCandidate(clean, clean.length, 'ansi', '_strip_ansi');
+
+  const fn = auto_detect_filter(clean);
+  if (fn === null) return _spill_or_pass(text, clean, ansiSaved, stats);
+
+  const out = safe_apply(fn, clean);
+
+  if (!out || out.length === 0) return _spill_or_pass(text, clean, ansiSaved, stats);
+  return spillCandidate(out, out.length > clean.length ? clean.length : out.length, 'auto-detected', fn.name);
+}
+
+function _spill_or_pass(text: string, clean: string, ansiSaved: number, stats: CompressStats): string {
+  const spillConfig = { ..._SPILL_CONFIG, thresholdChars: _caps.spillThreshold };
+  const res = _spillIfNeeded(text, spillConfig);
+  if (res.spilled && res.previewSize < text.length) {
+    stats.bytesAfter += res.previewSize;
+    stats.hits.push({ shape: 'spilled', filter: 'spill', saved: text.length - res.previewSize });
+    return res.content;
   }
-
-  const fn = auto_detect_filter(text);
-  if (fn === null) {
-    stats.bytesAfter += bytesIn;
-    return text;
+  if (ansiSaved > 0 && clean.length < text.length) {
+    stats.bytesAfter += clean.length;
+    stats.hits.push({ shape: 'ansi', filter: '_strip_ansi', saved: ansiSaved });
+    return clean;
   }
-
-  const out = safe_apply(fn, text);
-
-  if (!out || out.length === 0 || out.length >= bytesIn) {
-    stats.bytesAfter += bytesIn;
-    return text;
-  }
-
-  stats.bytesAfter += out.length;
-  stats.hits.push({
-    shape: 'auto-detected',
-    filter: fn.name,
-    saved: bytesIn - out.length,
-  });
-  return out;
+  stats.bytesAfter += text.length;
+  return text;
 }
 
 function _compress_kiro(body: RequestBody): CompressStats | null {

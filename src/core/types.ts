@@ -11,6 +11,7 @@ export interface ModelInfo {
   tool_call: boolean;
   reasoning: boolean;
   open_weights: boolean;
+  modalities: { input: string[]; output: string[] };
 }
 
 export interface ProviderGroup {
@@ -93,6 +94,7 @@ export interface ProxyConfig {
   upstreams?: Record<string, string>;
   saved_base_urls?: Record<string, string>;
   account_strategy?: string;
+  caps?: Record<string, number>;
 }
 
 export interface RtkHit {
@@ -119,6 +121,7 @@ export interface ProxyStatus {
   startedAt: string | null;
   proxiedProviders: string[];
   upstreams: Record<string, string>;
+  caps?: Record<string, number | undefined>;
 }
 
 export interface SqliteRow {
