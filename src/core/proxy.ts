@@ -83,6 +83,7 @@ const PREFER_HEADERS = new Set([
   'content-type',
   'authorization',
   'x-api-key',
+  'api-key',
   'user-agent',
   'accept',
   'anthropic-version',
@@ -92,6 +93,19 @@ const PREFER_HEADERS = new Set([
   'x-title',
   'http-referer',
 ]);
+
+// The `x-*` allow-rule below forwards every extension header, which would hand
+// this project's own control-plane credential to the LLM provider.
+const STRIP_HEADERS = new Set(['x-token-saver']);
+
+// Every header that can carry a credential, so a swap can clear all of them
+// before writing the replacement. Leaving a stale one behind is what makes an
+// upstream answer "invalid api key" after a reroute.
+const CREDENTIAL_HEADERS = ['authorization', 'x-api-key', 'api-key'];
+
+// Upstreams that authenticate with a raw key header instead of a bearer token.
+// Sending `Authorization: Bearer` to these is rejected as an invalid key.
+const RAW_KEY_HEADER_PROVIDERS = new Set(['anthropic', 'claudinio']);
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -323,15 +337,58 @@ export function saveConfig(cfg: ProxyConfig): void {
   writeJson(PROXY_CONFIG, cfg);
 }
 
+export function normalizeProviderId(pid: string): string {
+  return String(pid || '').trim().toLowerCase().replace(/-/g, '_');
+}
+
+/**
+ * The same provider is spelled differently depending on where the id came from:
+ * the `opencode` block in opencode.jsonc, the auth store (`opencode-go`) and
+ * the models.dev catalog (`opencode_go`). Credential and base-URL lookups try
+ * every spelling, otherwise a key saved under one name is invisible from another.
+ */
+export function providerIdAliases(pid: string): string[] {
+  const id = String(pid || '').trim().toLowerCase();
+  if (!id) return [];
+  const out = [id];
+  for (const candidate of [id.replace(/-/g, '_'), id.replace(/_/g, '-')]) {
+    if (!out.includes(candidate)) out.push(candidate);
+  }
+  // `opencode` and `opencode_go` are both OpenCode Zen.
+  if (id === 'opencode' || id === 'opencode_go' || id === 'opencode-go') {
+    for (const candidate of ['opencode', 'opencode_go', 'opencode-go']) {
+      if (!out.includes(candidate)) out.push(candidate);
+    }
+  }
+  return out;
+}
+
+function lookupByProvider<T>(record: Record<string, T> | null | undefined, pid: string): T | undefined {
+  if (!record || !pid) return undefined;
+  for (const alias of providerIdAliases(pid)) {
+    const v = record[alias];
+    if (v !== undefined && v !== null && v !== '') return v;
+  }
+  return undefined;
+}
+
 export function providerBaseUrl(pid: string): string {
   if (!pid) return '';
   const cfg = loadConfig();
-  const saved = cfg.saved_base_urls?.[pid] || cfg.upstreams?.[pid];
+  const saved = lookupByProvider<string>(cfg.saved_base_urls, pid) || lookupByProvider<string>(cfg.upstreams, pid);
   if (saved) return String(saved).replace(/\/+$/, '');
-  if (pid === 'openai' && process.env.OPENAI_BASE_URL) {
-    return String(process.env.OPENAI_BASE_URL).replace(/\/+$/, '');
+  // Honour <PROVIDER>_BASE_URL for every provider, not just openai. Without this
+  // a key minted for a custom gateway is sent to the hardcoded public upstream,
+  // which answers "invalid api key".
+  for (const alias of providerIdAliases(pid)) {
+    const envBase = process.env[`${alias.toUpperCase().replace(/-/g, '_')}_BASE_URL`];
+    if (envBase && String(envBase).trim()) return String(envBase).trim().replace(/\/+$/, '');
   }
-  return PROVIDER_BASE_URLS[pid] || '';
+  for (const alias of providerIdAliases(pid)) {
+    const known = PROVIDER_BASE_URLS[alias];
+    if (known) return known;
+  }
+  return '';
 }
 
 export function modelProvider(modelId: string): string {
@@ -356,31 +413,86 @@ function isSelfUrl(url: string): boolean {
   return new RegExp(`127\\.0\\.0\\.1:${port}|localhost:${port}`).test(url || '');
 }
 
-const AUTH_FILE = path.join(os.homedir(), '.local', 'share', 'opencode', 'auth.json');
+function authFilePaths(): string[] {
+  const home = process.env.TOKENSAVER_HOME || os.homedir();
+  return [
+    path.join(home, '.local', 'share', 'opencode', 'auth.json'),
+    path.join(home, '.config', 'opencode', 'auth.json'),
+  ];
+}
+
 const PROVIDER_ENV_KEYS: Record<string, string[]> = {
   zai: ['ZAI_API_KEY', 'Z_AI_API_KEY', 'ZHIPU_API_KEY'],
   openai: ['OPENAI_API_KEY'],
-  anthropic: ['ANTHROPIC_API_KEY'],
+  anthropic: ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN'],
   deepseek: ['DEEPSEEK_API_KEY'],
   groq: ['GROQ_API_KEY'],
   openrouter: ['OPENROUTER_API_KEY'],
+  google: ['GOOGLE_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_GENAI_API_KEY'],
+  siliconflow: ['SILICONFLOW_API_KEY'],
+  opencode: ['OPENCODE_ZEN_API_KEY', 'OPENCODE_API_KEY'],
+  opencode_go: ['OPENCODE_ZEN_API_KEY', 'OPENCODE_API_KEY', 'OPENCODE_GO_API_KEY'],
 };
 
+/**
+ * Best local credential for a provider: explicit env var first, then OpenCode's
+ * auth store. Returns '' when nothing usable is on disk so callers can fall back
+ * to passing the client's own credential through untouched.
+ */
 function apiKeyForProvider(pid: string): string {
   if (!pid) return '';
-  for (const envName of PROVIDER_ENV_KEYS[pid] || []) {
-    const v = process.env[envName];
-    if (v) return v;
+  const aliases = providerIdAliases(pid);
+  for (const alias of aliases) {
+    for (const envName of PROVIDER_ENV_KEYS[alias] || []) {
+      const v = process.env[envName];
+      if (v && v.trim()) return v.trim();
+    }
   }
-  try {
-    const auth = readJson<Record<string, any>>(AUTH_FILE, {}) || {};
-    const entry = auth[pid];
-    if (!entry) return '';
-    if (entry.api?.key) return String(entry.api.key);
-    if (entry.key) return String(entry.key);
-    if (entry.access) return String(entry.access);
-  } catch {}
+  for (const file of authFilePaths()) {
+    let auth: Record<string, any>;
+    try {
+      auth = readJson<Record<string, any>>(file, {}) || {};
+    } catch {
+      continue;
+    }
+    for (const alias of aliases) {
+      const entry = auth[alias];
+      if (!entry || typeof entry !== 'object') continue;
+      // OAuth entries hold an access/refresh token, not a provider API key.
+      // Presenting one of those as a bearer credential is a guaranteed 401.
+      if (entry.type && entry.type !== 'api') continue;
+      const key = entry.api?.key ?? entry.key;
+      if (key && String(key).trim()) return String(key).trim();
+    }
+  }
   return '';
+}
+
+/** The credential the client put on the request, if any. */
+function clientCredential(headers: http.IncomingHttpHeaders): string {
+  for (const name of CREDENTIAL_HEADERS) {
+    const raw = headers[name];
+    const v = Array.isArray(raw) ? raw[0] : raw;
+    if (v && String(v).trim()) return String(v).trim();
+  }
+  return '';
+}
+
+function usesRawKeyHeader(pid: string): boolean {
+  return RAW_KEY_HEADER_PROVIDERS.has(normalizeProviderId(pid));
+}
+
+/**
+ * Replace whatever credential the client sent with `key`, written in the style
+ * the upstream expects. Clearing first matters: a leftover key belonging to the
+ * provider we rerouted away from is exactly what upstream calls invalid.
+ */
+function applyCredential(headers: Record<string, string>, provider: string, key: string): void {
+  for (const name of Object.keys(headers)) {
+    if (CREDENTIAL_HEADERS.includes(name.toLowerCase())) delete headers[name];
+  }
+  if (usesRawKeyHeader(provider)) headers['x-api-key'] = key;
+  else headers['Authorization'] = `Bearer ${key}`;
 }
 
 function fallbackModelForProvider(pid: string): string {
@@ -420,9 +532,21 @@ export function pickHealthyFallback(excludeProvider: string): string | null {
     const curBase = providerBaseUrl(curPid);
     if (curBase && !isSelfUrl(curBase) && apiKeyForProvider(curPid)) return current;
   }
-  const auth = readJson<Record<string, any>>(AUTH_FILE, {}) || {};
-  for (const pid of Object.keys(auth)) {
-    if (pid === excludeProvider || pid === curPid) continue;
+  const authed: string[] = [];
+  for (const file of authFilePaths()) {
+    let auth: Record<string, any>;
+    try {
+      auth = readJson<Record<string, any>>(file, {}) || {};
+    } catch {
+      continue;
+    }
+    for (const pid of Object.keys(auth)) {
+      if (pid === excludeProvider || pid === curPid) continue;
+      if (authed.includes(pid)) continue;
+      authed.push(pid);
+    }
+  }
+  for (const pid of authed) {
     if (quotaTracker.is_rate_limited(pid)) continue;
     const base = providerBaseUrl(pid);
     if (!base || isSelfUrl(base)) continue;
@@ -530,6 +654,7 @@ function pickHeaders(headers: http.IncomingHttpHeaders): Record<string, string> 
     if (!v) continue;
     const lk = k.toLowerCase();
     if (HOP_BY_HOP.has(lk)) continue;
+    if (STRIP_HEADERS.has(lk)) continue;
     if (PREFER_HEADERS.has(lk) || lk.startsWith('x-')) out[k] = Array.isArray(v) ? v.join(', ') : String(v);
   }
   if (!out['Content-Type']) out['Content-Type'] = 'application/json';
@@ -648,6 +773,8 @@ function forward(
   modelId: string,
   stats: CompressStats | null,
   account: routing.Account | null,
+  credentialKey: string,
+  upstreamProvider: string,
   style: AppliedStyle | null = null
 ): void {
   const u = new URL(upstreamUrl);
@@ -655,7 +782,7 @@ function forward(
 
   function pick(): Record<string, string> {
     const headers = pickHeaders(req.headers);
-    if (account && account.api_key) headers['Authorization'] = `Bearer ${account.api_key}`;
+    if (credentialKey) applyCredential(headers, upstreamProvider, credentialKey);
     return headers;
   }
 
@@ -892,26 +1019,39 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         upstreamUrl = String(account.base_url).replace(/\/+$/, '') + canonicalEndpoint(pathOnly);
       }
     } catch {}
-    if (!account && rateLimitReroutedFrom) {
-      // cross-provider reroute: swap the client's (dead) credential for the healthy provider's key
-      try {
-        const pid = modelProvider(modelId);
-        const key = apiKeyForProvider(pid);
-        if (key) {
-          account = {
-            id: `authfile:${pid}`,
-            provider: pid,
-            api_key: key,
-            base_url: '',
-            priority: 1,
-            enabled: true,
-            consecutive_errors: 0,
-            rate_limited_until: null,
-          } as unknown as routing.Account;
-        } else {
-          console.log(`[ratelimit] no API key found for '${pid}' — client Authorization passed through unchanged`);
+
+    // Credential precedence: a configured account wins, then the client's own
+    // header, then whatever we hold locally for the provider we are actually
+    // calling. A reroute changes the receiving provider, so the client's key is
+    // no longer valid for it and must be replaced.
+    const rerouted = !!rateLimitReroutedFrom || budgetEnforced;
+    let credentialKey = '';
+    try {
+      if (account && account.api_key) {
+        credentialKey = String(account.api_key);
+      } else {
+        if (rerouted) {
+          const local = apiKeyForProvider(resolved.pid);
+          if (local) credentialKey = local;
+          else console.log(`[auth] no local API key for '${resolved.pid}' — client credential passed through unchanged`);
+        } else if (!clientCredential(req.headers)) {
+          // The client had no credential to offer, so an unauthenticated request
+          // would reach the upstream and come back as "invalid api key".
+          credentialKey = apiKeyForProvider(resolved.pid);
         }
-      } catch {}
+      }
+    } catch {}
+    if (rerouted && credentialKey) {
+      account = {
+        id: `authfile:${resolved.pid}`,
+        provider: resolved.pid,
+        api_key: credentialKey,
+        base_url: '',
+        priority: 1,
+        enabled: true,
+        consecutive_errors: 0,
+        rate_limited_until: null,
+      } as unknown as routing.Account;
     }
 
     _metrics.requestsServed += 1;
@@ -949,7 +1089,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       }
     }
 
-    forward(req, res, upstreamUrl, outBody, raw, pathOnly, modelId, stats, account, appliedStyle);
+    forward(req, res, upstreamUrl, outBody, raw, pathOnly, modelId, stats, account, credentialKey, resolved.pid, appliedStyle);
   });
 }
 

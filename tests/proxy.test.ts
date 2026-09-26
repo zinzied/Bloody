@@ -25,7 +25,12 @@ function listen(server: http.Server): Promise<number> {
   });
 }
 
-function post(port: number, pathname: string, body: string): Promise<{ status: number; body: string }> {
+function post(
+  port: number,
+  pathname: string,
+  body: string,
+  extraHeaders: Record<string, string> = {}
+): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     const data = Buffer.from(body);
     const req = http.request(
@@ -34,7 +39,7 @@ function post(port: number, pathname: string, body: string): Promise<{ status: n
         port,
         path: pathname,
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Content-Length': data.length },
+        headers: { 'Content-Type': 'application/json', 'Content-Length': data.length, ...extraHeaders },
       },
       (res) => {
         let chunks = '';
@@ -46,6 +51,33 @@ function post(port: number, pathname: string, body: string): Promise<{ status: n
     req.write(data);
     req.end();
   });
+}
+
+/** Raw header lines as they went out on the wire, so duplicates stay visible. */
+function rawHeaderLines(req: http.IncomingMessage): string[] {
+  const lines: string[] = [];
+  for (let i = 0; i < req.rawHeaders.length; i += 2) lines.push(`${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}`);
+  return lines;
+}
+
+/**
+ * Point the auth-file lookups at a throwaway home so one test's auth.json cannot
+ * influence the others. config.ts binds its own paths at import time, but the
+ * proxy resolves the auth locations per call.
+ */
+async function withIsolatedAuthHome<T>(auth: Record<string, any>, fn: () => Promise<T>): Promise<T> {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-auth-'));
+  const dir = path.join(home, '.local', 'share', 'opencode');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'auth.json'), JSON.stringify(auth), 'utf-8');
+  const previous = process.env.TOKENSAVER_HOME;
+  process.env.TOKENSAVER_HOME = home;
+  try {
+    return await fn();
+  } finally {
+    if (previous === undefined) delete process.env.TOKENSAVER_HOME;
+    else process.env.TOKENSAVER_HOME = previous;
+  }
 }
 
 test('canonicalEndpoint normalizes /v1 paths', () => {
@@ -392,5 +424,214 @@ test('proxy strips provider prefix from forwarded model', async () => {
   } finally {
     await proxy.stop();
     mock.close();
+  }
+});
+
+test('providerIdAliases treats the opencode spellings as one provider', () => {
+  assert.deepStrictEqual(proxy.normalizeProviderId('OpenCode-Go'), 'opencode_go');
+  for (const pid of ['opencode', 'opencode-go', 'opencode_go']) {
+    const aliases = proxy.providerIdAliases(pid);
+    for (const expected of ['opencode', 'opencode_go', 'opencode-go']) {
+      assert.ok(aliases.includes(expected), `${pid} should resolve to ${expected}`);
+    }
+  }
+  assert.deepStrictEqual(proxy.providerIdAliases(''), []);
+});
+
+test('providerBaseUrl resolves the zen base for every opencode spelling', () => {
+  proxy.saveConfig({ port: 0, enabled: false });
+  for (const pid of ['opencode', 'opencode-go', 'opencode_go']) {
+    assert.strictEqual(proxy.providerBaseUrl(pid), 'https://opencode.ai/zen/v1', `failed for ${pid}`);
+  }
+});
+
+test('providerBaseUrl honours ANTHROPIC_BASE_URL instead of the public api', () => {
+  proxy.saveConfig({ port: 0, enabled: false, saved_base_urls: {} });
+  process.env.ANTHROPIC_BASE_URL = 'https://gateway.internal/anthropic';
+  try {
+    assert.strictEqual(proxy.providerBaseUrl('anthropic'), 'https://gateway.internal/anthropic');
+  } finally {
+    delete process.env.ANTHROPIC_BASE_URL;
+  }
+});
+
+test('proxy supplies the stored credential when the client sends none', async () => {
+  // OpenCode keeps the zen key under `opencode-go` while the provider block is
+  // `opencode`, so the client arrives with no key and upstream answers
+  // "invalid api key" unless the proxy resolves the alias.
+  const seen: http.IncomingHttpHeaders[] = [];
+  const mock = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      seen.push(req.headers);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ id: 'ok' }));
+    });
+  });
+  const mockPort = await listen(mock);
+  proxy.saveConfig({ port: 0, enabled: false, saved_base_urls: { opencode: `http://127.0.0.1:${mockPort}/v1` } });
+  const body = JSON.stringify({ model: 'opencode/big-pickle', messages: [{ role: 'user', content: 'hi' }] });
+
+  await withIsolatedAuthHome({ 'opencode-go': { type: 'api', key: 'oc_sk_stored' } }, async () => {
+    await proxy.start(0);
+    try {
+      const s = await post(proxy.status().port!, '/v1/chat/completions', body);
+      assert.strictEqual(s.status, 200);
+      assert.strictEqual(seen[0].authorization, 'Bearer oc_sk_stored');
+    } finally {
+      await proxy.stop();
+    }
+  });
+  mock.close();
+});
+
+test("an OAuth access token is never used as a provider API key", async () => {
+  const seen: http.IncomingHttpHeaders[] = [];
+  const mock = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      seen.push(req.headers);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ id: 'ok' }));
+    });
+  });
+  const mockPort = await listen(mock);
+  proxy.saveConfig({ port: 0, enabled: false, saved_base_urls: { anthropic: `http://127.0.0.1:${mockPort}/v1` } });
+  const body = JSON.stringify({ model: 'anthropic/claude-opus-4-6', messages: [{ role: 'user', content: 'hi' }] });
+
+  await withIsolatedAuthHome({ anthropic: { type: 'oauth', access: 'oauth-access-token', refresh: 'r' } }, async () => {
+    await proxy.start(0);
+    try {
+      const s = await post(proxy.status().port!, '/v1/chat/completions', body);
+      assert.strictEqual(s.status, 200);
+      assert.strictEqual(seen[0].authorization, undefined, 'must not present an OAuth token as a bearer key');
+      assert.strictEqual(seen[0]['x-api-key'], undefined);
+    } finally {
+      await proxy.stop();
+    }
+  });
+  mock.close();
+});
+
+test('anthropic upstreams get x-api-key and never a bearer token', async () => {
+  const seen: string[] = [];
+  const mock = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      seen.push(...rawHeaderLines(req));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ id: 'ok' }));
+    });
+  });
+  const mockPort = await listen(mock);
+  proxy.saveConfig({ port: 0, enabled: false, saved_base_urls: { anthropic: `http://127.0.0.1:${mockPort}/v1` } });
+  proxy.accountManager.add_account('anthropic', 'sk-ant-account', '', 0);
+
+  const body = JSON.stringify({ model: 'anthropic/claude-opus-4-6', messages: [{ role: 'user', content: 'hi' }] });
+
+  await proxy.start(0);
+  try {
+    // The client still carries its own key; the account must fully replace it.
+    const s = await post(proxy.status().port!, '/v1/chat/completions', body, { 'x-api-key': 'client-stale-key' });
+    assert.strictEqual(s.status, 200);
+    assert.ok(seen.includes('x-api-key: sk-ant-account'), 'expected the account key as x-api-key');
+    assert.ok(
+      !seen.some((l) => /^authorization:/i.test(l)),
+      `anthropic must not receive a bearer header, got: ${seen.join(' | ')}`
+    );
+    assert.ok(!seen.some((l) => /client-stale-key/.test(l)), 'the stale client key must be cleared');
+  } finally {
+    await proxy.stop();
+    mock.close();
+  }
+});
+
+test('the control token is never forwarded to the upstream provider', async () => {
+  const seen: string[] = [];
+  const mock = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      seen.push(...rawHeaderLines(req));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ id: 'ok' }));
+    });
+  });
+  const mockPort = await listen(mock);
+  proxy.saveConfig({ port: 0, enabled: false, saved_base_urls: { groq: `http://127.0.0.1:${mockPort}/v1` } });
+
+  const body = JSON.stringify({ model: 'groq/llama-3.3-70b-versatile', messages: [{ role: 'user', content: 'hi' }] });
+
+  await proxy.start(0);
+  try {
+    const s = await post(proxy.status().port!, '/v1/chat/completions', body, {
+      Authorization: 'Bearer client-key',
+      'X-Token-Saver': 'secret-control-token',
+    });
+    assert.strictEqual(s.status, 200);
+    assert.ok(!seen.some((l) => /x-token-saver/i.test(l)), `control token leaked upstream: ${seen.join(' | ')}`);
+    assert.ok(seen.some((l) => /^authorization: Bearer client-key$/i.test(l)), 'the client credential still passes through');
+  } finally {
+    await proxy.stop();
+    mock.close();
+  }
+});
+
+test('a reroute clears the credential minted for the original provider', async () => {
+  const healthy: string[] = [];
+  const deadMock = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(429, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'FreeUsageLimitError', message: 'rate limit exceeded' } }));
+    });
+  });
+  const healthyMock = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      healthy.push(...rawHeaderLines(req));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ id: 'ok' }));
+    });
+  });
+  const deadPort = await listen(deadMock);
+  const healthyPort = await listen(healthyMock);
+  process.env.ZAI_API_KEY = 'test-zai-key';
+  const cfgDir = path.join(TMP, '.config', 'opencode');
+  fs.mkdirSync(cfgDir, { recursive: true });
+  const cfgFile = path.join(cfgDir, 'opencode.jsonc');
+  fs.writeFileSync(cfgFile, JSON.stringify({ model: 'zai/glm-4.5-flash', small_model: 'zai/glm-4.5-flash' }), 'utf-8');
+  proxy.saveConfig({
+    port: 0,
+    enabled: false,
+    proxied_providers: ['openai', 'zai'],
+    saved_base_urls: {
+      openai: `http://127.0.0.1:${deadPort}/v1`,
+      zai: `http://127.0.0.1:${healthyPort}/v1`,
+    },
+  });
+  const body = JSON.stringify({ model: 'openai/gpt-4o', messages: [{ role: 'user', content: 'hi' }] });
+
+  await proxy.start(0);
+  try {
+    await post(proxy.status().port!, '/v1/chat/completions', body, {
+      Authorization: 'Bearer openai-client-key',
+      'x-api-key': 'openai-client-key',
+    });
+    assert.ok(
+      healthy.some((l) => /zai-key/i.test(l)),
+      `the fallback credential should be used, got: ${healthy.join(' | ')}`
+    );
+    assert.ok(
+      !healthy.some((l) => /openai-client-key/i.test(l)),
+      `the dead provider's key must not survive the reroute, got: ${healthy.join(' | ')}`
+    );
+  } finally {
+    await proxy.stop();
+    deadMock.close();
+    healthyMock.close();
+    delete process.env.ZAI_API_KEY;
+    try {
+      fs.unlinkSync(cfgFile);
+    } catch {}
   }
 });
