@@ -246,6 +246,15 @@ fn handle_ws_frame(app: &AppHandle, frame: WsFrame) {
                 .show();
             update_tray_tooltip(app, "budget_exceeded");
         }
+        "limit.reached" => {
+            // The proxy is NOT blocked — the user decides: reset counters or stay blocked.
+            let reason = frame.payload.get("reason").and_then(|v| v.as_str()).unwrap_or("Daily limit reached");
+            let _ = app.notification().builder()
+                .title("Daily Limit Reached")
+                .body(&format!("{} — open Quota to Reset counters or Stay blocked", reason))
+                .show();
+            update_tray_tooltip(app, "limit_reached");
+        }
         "provider.ratelimited" => {
             let provider = frame.payload.get("provider").and_then(|v| v.as_str()).unwrap_or("unknown");
             let _ = app.notification().builder()
@@ -269,6 +278,7 @@ fn update_tray_tooltip(app: &AppHandle, status: &str) {
     let tooltip = match status {
         "connected" => "Bloody Token Saver — Connected",
         "budget_exceeded" => "Bloody Token Saver — Budget Exceeded!",
+        "limit_reached" => "Bloody Token Saver — Daily Limit Reached (Reset or stay blocked)",
         "ratelimited" => "Bloody Token Saver — Provider Rate Limited",
         "stopped" => "Bloody Token Saver — Stopped",
         _ => "Bloody Token Saver",

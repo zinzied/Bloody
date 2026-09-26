@@ -1,17 +1,43 @@
-import React from 'react';
+import React, { useCallback } from 'react';
 import { Box, Text } from 'ink';
 import { Page, Section, Row, Stat, Table, Hint, ErrorLine, Badge, fmt, countdown, T, Meter, Spinner } from '../components.js';
 import { useData } from '../useData.js';
+import { useScreenInput, type KeyEvent } from '../input.js';
 import { quotaSummary } from '../../core/insights.js';
+import { setLimitDecision } from '../../core/budget.js';
 
 export function QuotaPage() {
-  const { data, error } = useData(() => quotaSummary(), 3000);
+  const { data, error, reload } = useData(() => quotaSummary(), 3000);
   const budget = data?.budget as Record<string, any> | null | undefined;
   const budgetDaily = data?.budgetDaily as Record<string, any> | null | undefined;
   const budgetStatus = data?.budgetStatus as Record<string, any> | null | undefined;
   const quota = data?.quota as Record<string, any> | null | undefined;
   const providers = Object.entries(quota?.providers || {});
   const accounts = Object.entries(quota?.accounts || {});
+  const limitReached = Boolean(budgetStatus?.limitReached);
+  const choiceRequired = Boolean(budgetStatus?.choiceRequired);
+  const decision = (budgetStatus?.decision?.choice as string | null) || null;
+
+  // Daily limits never block the proxy: the user picks reset (keep configured model)
+  // or stay blocked (opt in to the free-model guard for today).
+  const onKey = useCallback(
+    (k: KeyEvent) => {
+      if (!limitReached) return false;
+      if (k.input === 'r') {
+        setLimitDecision('reset');
+        reload();
+        return true;
+      }
+      if (k.input === 'b') {
+        setLimitDecision('blocked');
+        reload();
+        return true;
+      }
+      return false;
+    },
+    [limitReached, reload]
+  );
+  useScreenInput(onKey);
 
   return (
     <Page title="Quota" sub="Provider quota tracker and per-task budget (live — refreshes every 3s).">
@@ -19,10 +45,29 @@ export function QuotaPage() {
       {!data && !error && <Spinner label="Loading quota…" />}
       {data && (
         <>
-          {/* Daily budget enforcement (new) */}
+          {/* Daily limit prompt — the proxy is never blocked until the user answers */}
+          {choiceRequired && (
+            <Section title="Daily limit reached — choose what happens next">
+              <Text color="yellow">{String(budgetStatus?.reason || 'Daily limit reached')}</Text>
+              <Box marginTop={1} flexDirection="column">
+                <Text>
+                  <Text bold color="green">[r]</Text> Reset counters — keep using your configured model (never blocks the proxy)
+                </Text>
+                <Text>
+                  <Text bold color="red">[b]</Text> Stay blocked — keep the free-model guard for today (
+                  {String(budgetStatus?.fallbackModel || 'free model')})
+                </Text>
+              </Box>
+              <Hint>Nothing is blocked meanwhile — requests keep flowing to your configured model.</Hint>
+            </Section>
+          )}
+          {limitReached && decision === 'blocked' && (
+            <Hint>Blocked by your choice — press `r` after re-opening this page or run `token-saver budget reset` to switch back.</Hint>
+          )}
+          {/* Daily budget guard (user-controlled) */}
           {budgetStatus ? (
             <>
-              <Section title="Daily Budget — auto-fallback guard">
+              <Section title="Daily Budget — user-controlled guard">
                 <Row>
                   <Stat label="Policy mode" value={(budgetStatus.policy as any)?.mode || '—'} />
                   <Stat
@@ -55,13 +100,15 @@ export function QuotaPage() {
                   />
                 </Row>
                 <Box marginTop={1} flexDirection="row">
-                  {(budgetStatus as any).exceeded ? (
-                    <Badge ok={false}> EXCEEDED — auto-routing to free model: {(budgetStatus as any).fallbackModel || '—'} </Badge>
+                  {budgetStatus?.blockingActive ? (
+                    <Badge ok={false}> BLOCKED BY YOUR CHOICE — free-model guard: {String(budgetStatus.fallbackModel || '—')} </Badge>
+                  ) : limitReached ? (
+                    <Badge ok={false}> LIMIT REACHED — NOT blocking; press r (reset) or b (stay blocked) </Badge>
                   ) : (
                     <Badge ok={true}> Budget OK — requests use configured model </Badge>
                   )}
                   <Text> </Text>
-                  <Text color="gray">{(budgetStatus as any).reason || 'No limit hit'}</Text>
+                  <Text color="gray">{budgetStatus?.reason || 'No limit hit'}</Text>
                 </Box>
                 {budgetDaily && (
                   <Hint>

@@ -22,6 +22,7 @@ export const eventBus = new EventEmitter();
 // Topic constants
 export const EVENT_TOPICS = {
   budgetExceeded: 'budget.exceeded',
+  dailyLimitReached: 'limit.reached',
   providerRatelimited: 'provider.ratelimited',
   proxyRequest: 'proxy.request',
   proxyStopped: 'proxy.stopped',
@@ -158,6 +159,40 @@ async function handleBudget(_req: http.IncomingMessage, res: http.ServerResponse
   sendJson(res, 200, data);
 }
 
+/**
+ * GET  /api/limits → current daily-limit status (limitReached / choiceRequired / decision)
+ * POST /api/limits → answer the prompt with { action: 'reset' | 'blocked' }
+ *
+ * A reached limit never blocks the proxy by itself; only an explicit 'blocked'
+ * decision (recorded for today) allows the free-model guard to reroute requests.
+ */
+async function handleLimits(req: http.IncomingMessage, res: http.ServerResponse, _url: URL) {
+  if (req.method === 'GET') {
+    sendJson(res, 200, budget.getBudgetStatus());
+    return;
+  }
+  if (req.method !== 'POST') {
+    sendJson(res, 405, { error: 'method not allowed' });
+    return;
+  }
+  let body = '';
+  req.on('data', (chunk) => { body += chunk; });
+  req.on('end', () => {
+    try {
+      const { action } = JSON.parse(body || '{}') as { action?: string };
+      if (action === 'reset') proxy.resetDailyLimit();
+      else if (action === 'blocked') proxy.blockDailyLimit();
+      else {
+        sendJson(res, 400, { error: 'invalid action: expected "reset" or "blocked"' });
+        return;
+      }
+      sendJson(res, 200, { ok: true, action, status: budget.getBudgetStatus() });
+    } catch {
+      sendJson(res, 400, { error: 'invalid body: expected { action: "reset" | "blocked" }' });
+    }
+  });
+}
+
 // ---- Router ----
 const routeHandlers: Record<string, (req: http.IncomingMessage, res: http.ServerResponse, url: URL) => Promise<void>> = {
   '/api/overview': handleOverview,
@@ -171,6 +206,7 @@ const routeHandlers: Record<string, (req: http.IncomingMessage, res: http.Server
   '/api/models': handleModels,
   '/api/doctor': handleDoctor,
   '/api/budget': handleBudget,
+  '/api/limits': handleLimits,
 };
 
 export async function handleControlApi(

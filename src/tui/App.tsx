@@ -94,7 +94,7 @@ function Shell({ onExit }: { onExit: () => void }) {
       </Box>
       <Box paddingLeft={1} paddingBottom={1}>
         <Text color={theme.dim}>
-          Up/Down: navigate · q: quit · Esc: back/cancel. Pages with inputs accept Enter/Esc.
+          Up/Down: navigate · q: quit · Esc: back/cancel. Quota page: r = reset counters, b = stay blocked.
         </Text>
       </Box>
     </InputProvider>

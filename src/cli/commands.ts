@@ -50,8 +50,11 @@ proxy restore                     restore direct provider URLs (use if the proxy
   tokens info                        tokenizer info (tiktoken vs heuristic)
   tokens count <text>                count tokens (accurate vs heuristic)
   tokens estimate '<json>'           estimate tokens for a request body (accurate)
-  budget status                      daily spend vs budget + enforcement guard
-  budget reset                       reset daily budget counters
+  budget status                      daily spend vs limit + your reset/blocked choice
+  budget reset                       reset daily counters (choose "reset": never blocks the proxy)
+  budget block                       choose "stay blocked" today (opt in to the free-model guard)
+  budget unblock                     clear today's choice (ask again on the next request)
+  limits get                         same as budget status, includes choiceRequired/decision
   doctor [--fix]                     health check (quota/budget/proxy/tokenizer/model) — --fix clears stale rate_limits
   recall <id|path> [--head N]        print a spilled tool output in full (proxy spills >16KB to ~/.config/opencode/spill)
   recall --list [--max N]            list recent spill files (default 20)
@@ -142,8 +145,8 @@ async function cmdQuota(): Promise<number> {
     const daily = bs.daily as Record<string, any>;
     out(`Daily guard: mode=${pol.mode} budget $${Number(pol.daily_budget_usd).toFixed(2)}/day free ${fmt(pol.free_daily_token_limit)} tok/day`);
     out(`Spent today: $${Number(bs.spentUSD).toFixed(4)} (${fmt(bs.spentTokens)} tok, ${fmt(daily.requests)} req) · remaining $${Number(bs.remainingUSD).toFixed(4)} / ${fmt(bs.remainingTokens)} tok`);
-    if (bs.exceeded) out(`BUDGET EXCEEDED: ${bs.reason} → fallback ${bs.fallbackModel || '—'} (auto-routing active)`);
-    else out(`Status: OK — no enforcement (${bs.reason || 'within limits'})`);
+    out(`Proxy blocking: ${bs.blockingActive ? 'ACTIVE (you chose "stay blocked")' : 'OFF — limits never block the proxy'}`);
+    out(`Status: ${formatLimitDecision(bs)}`);
     out();
   }
   if (budgetDaily) {
@@ -614,27 +617,48 @@ function cmdTokens(args: string[]): number {
   }
 }
 
+function formatLimitDecision(s: Record<string, any>): string {
+  const choice = s.decision?.choice || null;
+  if (!s.limitReached) return 'OK — within limits';
+  if (choice === 'blocked') return `REACHED — you chose "stay blocked" (guard active → ${s.fallbackModel || '—'})`;
+  if (choice === 'reset') return 'REACHED — you chose "reset" (counters cleared, configured model used)';
+  return `REACHED — waiting for your choice: "budget reset" (keep configured model) or "budget block" (stay blocked)`;
+}
+
 function cmdBudget(args: string[]): number {
   const { positionals } = parseFlags(args);
   const sub = positionals[0] || 'status';
   switch (sub) {
-    case 'status': {
-      const s = budget.getBudgetStatus() as unknown as Record<string, unknown>;
+    case 'status':
+    case 'get': {
+      const s = budget.getBudgetStatus() as unknown as Record<string, any>;
       const pol = s.policy as Record<string, any>;
       const daily = s.daily as Record<string, any>;
       out(`Policy: mode=${pol.mode} budget $${Number(pol.daily_budget_usd).toFixed(2)}/day free ${fmt(pol.free_daily_token_limit)}/day max $${pol.max_paid_cost_per_million}/M`);
       out(`Daily: ${daily.date} · $${Number(s.spentUSD).toFixed(4)} spent (${fmt(s.spentTokens)} tok, ${fmt(daily.requests)} req) · $${Number(s.remainingUSD).toFixed(4)} left / ${fmt(s.remainingTokens)} tok`);
-      if (s.exceeded) out(`ENFORCED: ${s.reason} → fallback ${s.fallbackModel}`);
-      else out(`Status: OK — ${s.reason || 'within limits'}`);
+      out(`Proxy blocking: ${s.blockingActive ? 'ACTIVE (you opted in)' : 'OFF — limits never block the proxy'}`);
+      out(`Status: ${formatLimitDecision(s)}`);
+      if (s.reason) out(`Reason: ${s.reason}`);
       return 0;
     }
     case 'reset': {
-      budget.resetDailyForTests();
-      out('Daily budget counters reset.');
+      budget.setLimitDecision('reset');
+      out('Daily counters reset — the proxy keeps using your configured model.');
+      return 0;
+    }
+    case 'block':
+    case 'blocked': {
+      budget.setLimitDecision('blocked');
+      out('Choice recorded: stay blocked today — the free-model guard stays active until midnight.');
+      return 0;
+    }
+    case 'unblock': {
+      budget.clearLimitDecision();
+      out('Choice cleared — you will be asked again on the next request (nothing is blocked meanwhile).');
       return 0;
     }
     default:
-      outErr('usage: budget status|reset');
+      outErr('usage: budget status|reset|block|unblock');
       return 1;
   }
 }
@@ -647,7 +671,7 @@ function cmdDoctor(args: string[]): number {
   out(`Doctor — ${d.ok ? 'OK' : `${d.issues.length} issue(s)`}${fix ? ' (fix applied where safe)' : ''}`);
   out(`Model: ${d.currentModel || '—'}  Tokenizer: ${d.tokenizer.available ? `✓ ${d.tokenizer.encoding}` : '⚠ heuristic'}`);
   out(`Proxy: ${d.proxy.enabled ? `enabled :${d.proxy.port} proxied=${(d.proxy.proxied_providers||[]).join(',')||'—'}` : 'disabled'}`);
-  out(`Budget: ${d.budgetStatus ? `${(d.budgetStatus as any).spentTokens} tok today / ${(d.budgetStatus as any).policy.free_daily_token_limit} limit — ${(d.budgetStatus as any).exceeded ? 'EXCEEDED' : 'ok'}` : '—'}`);
+  out(`Budget: ${d.budgetStatus ? `${(d.budgetStatus as any).spentTokens} tok today / ${(d.budgetStatus as any).policy.free_daily_token_limit} limit — ${(d.budgetStatus as any).limitReached ? 'LIMIT REACHED' : 'ok'} · decision: ${(d.budgetStatus as any).decision?.choice || 'not answered (proxy not blocked)'}` : '—'}`);
   out();
   if (d.issues.length) {
     out('Issues:');
@@ -666,9 +690,10 @@ function cmdDoctor(args: string[]): number {
     out('Hint: run `token-saver doctor --fix` to clear only expired rate_limits (safe).');
     out('Auto-clear is GOOD for stale TTLs (rate_limited_until < now) — bad for 401 auth failures inside window (hides real bad key).');
   }
-  if (d.budgetStatus?.exceeded) {
-    out('Budget exceeded — daily tokens exceed free limit; proxy forces fallback and can cause 401 if fallback also rate-limited.');
-    out('  fix: `token-saver budget reset` or `token-saver models policy set --free-limit 5000000` or set TOKENSAVER_BUDGET_ENFORCE=0 to bypass.');
+  if (d.budgetStatus?.limitReached) {
+    out('Daily limit reached — the proxy is NOT blocked; it keeps using your configured model until you answer.');
+    out('  choose: `token-saver budget reset` (clear counters, keep configured model) or `token-saver budget block` (stay blocked → free-model guard).');
+    out('  `token-saver budget unblock` clears your choice so you get asked again.');
   }
   return d.ok ? 0 : 1;
 }
@@ -716,6 +741,8 @@ export async function runCommand(argv: string[]): Promise<number> {
       return cmdTokens(rest);
     case 'budget':
       return cmdBudget(rest);
+    case 'limits':
+      return cmdBudget(rest.length ? rest : ['status']);
     case 'doctor':
       return cmdDoctor(rest);
     case 'recall':

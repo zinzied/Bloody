@@ -401,12 +401,19 @@ export function doctorSummary(opts: { fix?: boolean } = {}) {
     }
   }
   // auth failures vs rate limit - don't auto-clear 401 inside window
-  // budget
-  if (budgetStatus && (budgetStatus as any).exceeded) {
-    issues.push(`budget exceeded: ${(budgetStatus as any).reason} — fallback ${(budgetStatus as any).fallbackModel} (daily ${(budgetDaily as any)?.tokensTotal} tok)`);
-    if (opts.fix) {
-      // auto-clear only if daily > limit by >2x, suggest raising limit rather than clearing counts
-      fixes.push(`budget exceeded — run 'budget reset' or raise free_daily_token_limit via models policy`);
+  // budget / daily limit — informational only, the proxy never blocks until the user decides
+  const bs = budgetStatus as unknown as Record<string, any> | null;
+  if (bs && bs.limitReached) {
+    const decision: string | null = bs.decision?.choice || null;
+    if (decision === 'blocked') {
+      issues.push(`daily limit reached: ${bs.reason} — you chose "stay blocked", guard active (fallback ${bs.fallbackModel})`);
+    } else if (decision === 'reset') {
+      fixes.push(`daily limit was answered with "reset" today (${bs.reason})`);
+    } else {
+      issues.push(`daily limit reached: ${bs.reason} — choose 'budget reset' to keep your configured model or 'budget block' to stay blocked`);
+    }
+    if (opts.fix && decision !== 'blocked') {
+      fixes.push(`answer the prompt with 'token-saver budget reset' (reset counters) or 'token-saver budget block' (stay blocked)`);
     }
   }
   // tokenizer

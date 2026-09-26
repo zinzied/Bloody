@@ -116,6 +116,45 @@ const _metrics: {
 export const accountManager = new routing.AccountManager();
 export const quotaTracker = new QuotaTracker();
 
+let _limitPromptedDate: string | null = null;
+
+/**
+ * Ask the user to answer a reached daily limit.
+ * Emitted at most once per day, and — crucially — it never blocks or reroutes the
+ * request: the caller keeps forwarding to the configured model until the user
+ * explicitly chooses "stay blocked".
+ */
+export function promptDailyLimitChoice(): void {
+  try {
+    const status = budget.getBudgetStatus();
+    if (!status.limitReached || status.decision) return;
+    if (_limitPromptedDate === status.daily.date) return;
+    _limitPromptedDate = status.daily.date;
+    const message = `${status.reason || 'Daily limit reached'} — choose "reset" to keep using your configured model, or "blocked" to keep the free-model guard for today.`;
+    console.log(`[limit] ${message}`);
+    emitEvent(EVENT_TOPICS.dailyLimitReached, {
+      reason: status.reason,
+      message,
+      choices: ['reset', 'blocked'],
+      spentTokens: status.spentTokens,
+      freeDailyTokenLimit: status.policy.free_daily_token_limit,
+      dailyBudgetUSD: status.policy.daily_budget_usd,
+      decision: null,
+    });
+  } catch {}
+}
+
+/** Reset today's counters after the user picked "reset". */
+export function resetDailyLimit(): void {
+  budget.setLimitDecision('reset');
+  _limitPromptedDate = null;
+}
+
+/** The user picked "stay blocked" — opt in to the guard for today. */
+export function blockDailyLimit(): void {
+  budget.setLimitDecision('blocked');
+}
+
 export function loadConfig(): ProxyConfig {
   return readJson<ProxyConfig>(PROXY_CONFIG, null) || {};
 }
@@ -601,14 +640,17 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         data.model = data.model.slice(prefix.length + 1);
       }
     }
-    // Budget enforcement: auto-fallback to free/cheap model when daily budget exceeded
+    // Daily limit guard: OFF by default. A reached limit never blocks or reroutes the
+    // proxy — the user is asked to choose "reset" (clear counters) or "stay blocked",
+    // and only an explicit "blocked" decision for today may reroute to the free model.
     let budgetEnforced = false;
     let originalModelId = modelId;
     let enforcedFallback: string | null = null;
-    if (process.env.TOKENSAVER_BUDGET_ENFORCE !== '0' && data) {
+    const guardAllowed = process.env.TOKENSAVER_BUDGET_ENFORCE !== '0';
+    if (data) {
       try {
         const check = budget.shouldEnforceBudget();
-        if (check.enforce && check.fallbackModel) {
+        if (guardAllowed && check.enforce && check.fallbackModel) {
           // only enforce if original model is not already the fallback
           const fallbackShort = check.fallbackModel.includes('/') ? check.fallbackModel.split('/').slice(1).join('/') : check.fallbackModel;
           const currentShort = String(data.model || modelId).split('/').pop() || '';
@@ -622,13 +664,16 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             data.model = fallbackShort;
             modelId = check.fallbackModel;
             budgetEnforced = true;
-            console.log(`[budget] daily budget exceeded (${check.reason}) — routing ${originalModelId} → ${check.fallbackModel}`);
+            console.log(`[budget] user chose "blocked" (${check.reason}) — routing ${originalModelId} → ${check.fallbackModel}`);
             emitEvent(EVENT_TOPICS.budgetExceeded, {
               reason: check.reason,
               fallbackModel: check.fallbackModel,
               originalModel: originalModelId,
             });
           }
+        } else if (check.limitReached) {
+          // Ask (once per day) but forward the request untouched to the configured model.
+          promptDailyLimitChoice();
         }
       } catch {}
     }
@@ -877,8 +922,8 @@ export function ensureProxiedProviders(port?: number, rewriteConfig = false): Pr
 export function start(port?: number): Promise<ProxyStatus> {
   return new Promise((resolve, reject) => {
     if (_server) return resolve(status());
-    // Activate budget enforcement + rate-limit fallback by default
-    if (process.env.TOKENSAVER_BUDGET_ENFORCE === undefined) process.env.TOKENSAVER_BUDGET_ENFORCE = '1';
+    // Daily limits never block by default: the user answers "reset" / "stay blocked" from the UI.
+    // Set TOKENSAVER_BUDGET_ENFORCE=0 to hard-disable the guard even after the user opted in.
     if (process.env.TOKENSAVER_RATELIMIT_FALLBACK === undefined) process.env.TOKENSAVER_RATELIMIT_FALLBACK = '1';
     const targetPort = port !== undefined && port !== null ? port : loadConfig().port || DEFAULT_PORT;
     rtk.set_filter_caps && rtk.set_filter_caps(loadConfig().caps || {});

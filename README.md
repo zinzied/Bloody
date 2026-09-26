@@ -136,6 +136,13 @@ Detects unproductive agent patterns:
 - **Exponential backoff** on errors (2s → 4s → 8s → ... → 5 min max)
 - **Model-level locks**: prevent a model from hitting the same account repeatedly
 
+### Daily Limits (never blocks by default)
+
+- **No silent blocking**: reaching the daily token limit or budget never rejects or silently reroutes a request
+- **You choose**: the TUI Quota page (`r` = reset counters, `b` = stay blocked), the desktop Quota screen, or `token-saver budget reset|block|unblock`
+- **Tracked, not enforced**: spend/tokens are still recorded in `~/.config/opencode/compress/budget_daily.json`; the free-model guard only activates after you explicitly answer "stay blocked" for the day (decision stored in `budget_daily.json`'s sibling `limit_decision.json`, expiring at midnight)
+- **Last-resort kill switch**: `TOKENSAVER_BUDGET_ENFORCE=0` disables the guard even after you opted in
+
 ### Quota Tracking
 
 - **Per-provider quota**: remaining, total, reset countdown

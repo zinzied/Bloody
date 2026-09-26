@@ -50,6 +50,11 @@ export const api = {
   models: () => fetchJson<any>('/models'),
   doctor: (fix = false) => fetchJson<any>(`/doctor?fix=${fix}`),
   budget: () => fetchJson<any>('/budget'),
+  limits: {
+    get: () => fetchJson<BudgetStatusData>('/limits'),
+    /** Answer the daily-limit prompt: 'reset' (keep configured model) or 'blocked' (stay blocked). */
+    answer: (action: 'reset' | 'blocked') => fetchJson<{ ok: boolean; action: string; status: BudgetStatusData }>('/limits', { method: 'POST', body: JSON.stringify({ action }) }),
+  },
 };
 
 // Type-safe shorthand for the shapes we care about (subset of insights.ts return types)
@@ -68,12 +73,7 @@ export interface QuotaData {
   };
   budget: { task: string; budget_limit: number; total_allocated: number; remaining: number; allocation: Record<string, number>; task_tokens?: number } | null;
   budgetDaily: { date: string; tokensTotal: number; tokensIn: number; tokensOut: number; costUSD: number; requests: number; lastUpdated: string } | null;
-  budgetStatus: {
-    policy: { mode: string; daily_budget_usd: number; free_daily_token_limit: number; max_paid_cost_per_million: number };
-    daily: { date: string; tokensTotal: number; tokensIn: number; tokensOut: number; costUSD: number; requests: number };
-    spentUSD: number; remainingUSD: number; spentTokens: number; remainingTokens: number;
-    exceeded: boolean; reason: string | null; fallbackModel: string | null;
-  } | null;
+  budgetStatus: BudgetStatusData | null;
 }
 
 export interface RoutingData {
@@ -144,6 +144,12 @@ export interface StatusData {
   upstreams: Record<string, string>;
 }
 
+export interface LimitDecisionData {
+  date: string;
+  choice: 'reset' | 'blocked';
+  decidedAt: string;
+}
+
 export interface BudgetStatusData {
   policy: { mode: string; daily_budget_usd: number; free_daily_token_limit: number; max_paid_cost_per_million: number };
   daily: { date: string; tokensTotal: number; tokensIn: number; tokensOut: number; costUSD: number; requests: number };
@@ -152,6 +158,14 @@ export interface BudgetStatusData {
   spentTokens: number;
   remainingTokens: number;
   exceeded: boolean;
+  /** A daily limit has been reached — informational only; it never blocks the proxy by itself. */
+  limitReached: boolean;
+  /** True when a limit is reached and the user has not answered reset/blocked for today. */
+  choiceRequired: boolean;
+  /** Today's explicit answer, or null when the user has not answered yet. */
+  decision: LimitDecisionData | null;
+  /** True only when the user explicitly chose "stay blocked" for today. */
+  blockingActive: boolean;
   reason: string | null;
   fallbackModel: string | null;
 }

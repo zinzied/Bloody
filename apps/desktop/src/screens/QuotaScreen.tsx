@@ -5,6 +5,21 @@ import { fmt, countdown } from '../fmt';
 
 export function QuotaScreen({ enginePort }: { enginePort: number | null }) {
   const { data, error, reload } = usePoll(() => api.quota(), 3000);
+  const [busy, setBusy] = React.useState(false);
+  const [actionError, setActionError] = React.useState('');
+
+  const answer = async (action: 'reset' | 'blocked') => {
+    setBusy(true);
+    setActionError('');
+    try {
+      await api.limits.answer(action);
+      reload();
+    } catch (e) {
+      setActionError(String((e as Error).message || e));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   if (!data && !error) {
     return <div className="spinner"><span className="spinner-frame">⠋</span>Loading quota…</div>;
@@ -16,18 +31,50 @@ export function QuotaScreen({ enginePort }: { enginePort: number | null }) {
   const budgetDaily = q.budgetDaily;
   const providers = Object.entries(q.quota?.providers || {});
   const accounts = Object.entries(q.quota?.accounts || {});
+  const limitReached = Boolean(budgetStatus?.limitReached);
+  const decision = budgetStatus?.decision?.choice || null;
 
   return (
     <div className="page">
       <header className="page-header">
         <h1 className="page-title">Quota</h1>
-        <p className="page-subtitle">Provider quota tracker and per-task budget</p>
+        <p className="page-subtitle">Provider quota tracker and per-task budget — daily limits never block the proxy until you choose</p>
       </header>
+
+      {limitReached && (
+        <section className="section">
+          <h2 className="section-title">Daily Limit Reached — What Should Happen Next?</h2>
+          <div className="hint mt-2">{budgetStatus?.reason || 'Daily limit reached'}</div>
+          <div className="flex gap-2 mt-3">
+            <button
+              className="badge ok"
+              style={{ cursor: busy ? 'default' : 'pointer', opacity: busy ? 0.6 : 1 }}
+              disabled={busy}
+              onClick={() => answer('reset')}
+            >
+              Reset counters — keep using my configured model
+            </button>
+            <button
+              className="badge err"
+              style={{ cursor: busy ? 'default' : 'pointer', opacity: busy ? 0.6 : 1 }}
+              disabled={busy}
+              onClick={() => answer('blocked')}
+            >
+              Stay blocked — keep the free-model guard for today
+            </button>
+          </div>
+          <div className="hint mt-2">
+            Nothing is blocked meanwhile — requests keep flowing to your configured model until you answer.
+            {decision ? ` Today's answer: ${decision === 'reset' ? 'reset counters' : 'stay blocked'}.` : ''}
+          </div>
+          {actionError && <div className="error-line mt-2">{actionError}</div>}
+        </section>
+      )}
 
       {budgetStatus && (
         <>
           <section className="section">
-            <h2 className="section-title">Daily Budget — Auto-Fallback Guard</h2>
+            <h2 className="section-title">Daily Budget — User-Controlled Guard</h2>
             <div className="stats-row">
               <div className="stat-card">
                 <div className="stat-label">Policy Mode</div>
@@ -74,8 +121,10 @@ export function QuotaScreen({ enginePort }: { enginePort: number | null }) {
             </div>
 
             <div className="flex gap-2 mt-3">
-              {budgetStatus.exceeded ? (
-                <span className="badge err"> EXCEEDED — Auto-routing to: {budgetStatus.fallbackModel || '—'} </span>
+              {budgetStatus.blockingActive ? (
+                <span className="badge err"> BLOCKED BY YOUR CHOICE — Guard active: {budgetStatus.fallbackModel || '—'} </span>
+              ) : limitReached ? (
+                <span className="badge err"> LIMIT REACHED — Not blocking: choose “Reset counters” or “Stay blocked” </span>
               ) : (
                 <span className="badge ok"> Budget OK — Using configured model </span>
               )}
