@@ -171,7 +171,7 @@ export function estimate_request_tokens_accurate(body: {
       tokens += estimate_message_tokens_accurate(msg as never);
     }
   }
-  // Responses API: input array
+  // Responses API: input array, or a bare string prompt
   if (Array.isArray(body.input)) {
     for (const item of body.input as Array<Record<string, unknown>>) {
       if (!item || typeof item !== 'object') continue;
@@ -187,6 +187,10 @@ export function estimate_request_tokens_accurate(body: {
         tokens += count_tokens(JSON.stringify(item)) + BLOCK_OVERHEAD;
       }
     }
+  } else if (typeof body.input === 'string') {
+    // The single-string form is valid for the Responses API (translate.ts reads
+    // it as such), and it used to fall through both branches and count as 0.
+    tokens += count_tokens(body.input) + ROLE_OVERHEAD;
   }
   return tokens;
 }

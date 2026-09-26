@@ -51,7 +51,10 @@ export function spillIfNeeded(
   fs.writeFileSync(spillPath, text, 'utf8');
 
   const head = text.slice(0, config.previewHeadChars);
-  const tail = text.slice(-config.previewTailChars);
+  // `slice(-0)` is `slice(0)`, so a zero/NaN tail budget used to hand back the
+  // whole original as the "preview" — larger than the input it claims to shrink.
+  const tailChars = Number(config.previewTailChars);
+  const tail = Number.isFinite(tailChars) && tailChars > 0 ? text.slice(-tailChars) : '';
   const preview = head + SPILL_MARKER + tail;
 
   return {

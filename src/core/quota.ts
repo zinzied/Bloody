@@ -164,7 +164,10 @@ export class QuotaTracker {
       if (data.remaining !== undefined) entry.remaining = data.remaining;
       if (data.total_quota !== undefined) entry.total = data.total_quota;
       if (data.reset_at) entry.reset_in = this.get_reset_countdown(provider) || '';
-      if (data.rate_limited_until) entry.rate_limited = true;
+      // Compared against now, not just tested for presence. Nothing expires the
+      // marker on its own (only a success or an explicit clear_rate_limit does),
+      // so a single 429 left the provider showing as rate-limited for good.
+      if (data.rate_limited_until && Date.parse(data.rate_limited_until) > Date.now()) entry.rate_limited = true;
       if (data.total_cost !== undefined) {
         entry.cost = Math.round(data.total_cost * 10000) / 10000;
         entry.requests = data.request_count || 0;
@@ -239,6 +242,7 @@ function pickHeader(lower: Record<string, string | string[] | undefined>, names:
 
 export function normalizeReset(raw: string | string[]): string | null {
   const text = String(raw).trim().toLowerCase();
+  if (!text) return null;
   const secs = /^([\d.]+)\s*s$/.exec(text);
   if (secs) return new Date(Date.now() + Number(secs[1]) * 1000).toISOString();
   const numeric = Number(text);

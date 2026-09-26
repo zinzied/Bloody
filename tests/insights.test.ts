@@ -119,8 +119,10 @@ test('usageSummary aggregates ledger + proxy history', () => {
   assert.strictEqual(u.ledger.saved_tokens, 50004);
   assert.strictEqual(u.ledger.raw_tokens, 50025);
   assert.strictEqual(u.proxy.requests, 2);
-  assert.strictEqual(u.proxy.saved_tokens, 1120);
-  assert.strictEqual(u.proxy.saved_bytes, 5300);
+  // The all-time totals only, not those totals plus the history entries they were
+  // built from: the fixture's 1000/5000 already include its 120/300.
+  assert.strictEqual(u.proxy.saved_tokens, 1000);
+  assert.strictEqual(u.proxy.saved_bytes, 5000);
   const fileRead = u.byKind.find((k: any) => k.kind === 'file_read');
   assert.strictEqual(fileRead!.saved_tokens, 49987);
   assert.strictEqual(u.perModel.length, 2);
@@ -210,4 +212,69 @@ test('settingsGet reads config and lists backups', () => {
   assert.strictEqual(s.current, 'openai/gpt-x');
   assert.ok(s.path.includes('opencode.jsonc'));
   assert.ok(Array.isArray(s.backups));
+});
+
+const QUOTA_FILE = path.join(comp, 'quota_tracker.json');
+const quotaBackup = fs.readFileSync(QUOTA_FILE, 'utf-8');
+
+test('doctorSummary --fix clears only expired rate limits and reports nothing else as fixed', () => {
+  const live = new Date(Date.now() + 600_000).toISOString();
+  const dead = new Date(Date.now() - 600_000).toISOString();
+  fs.writeFileSync(
+    QUOTA_FILE,
+    JSON.stringify({
+      providers: {
+        'stale-provider': { rate_limited_until: dead, rate_limited_model: 'x/y', total_cost: 1.5 },
+        'live-provider': { rate_limited_until: live, total_quota: 100, remaining: 10, total_cost: 2.25, request_count: 4 },
+      },
+      accounts: {},
+    }),
+    'utf-8'
+  );
+
+  try {
+    // Read-only pass: the stale one is reported as an issue, and nothing is fixed.
+    const dry = insights.doctorSummary();
+    assert.ok(dry.issues.some((i: string) => i.includes('stale rate_limit stale-provider')));
+    assert.ok(dry.issues.some((i: string) => i.includes('rate_limited live-provider')));
+    assert.strictEqual(dry.fixed, 0);
+    assert.deepStrictEqual(dry.fixes, [], 'a read-only pass fixes nothing');
+
+    const applied = insights.doctorSummary({ fix: true });
+    assert.strictEqual(applied.fixed, 1, 'only the expired marker was cleared');
+    assert.ok(applied.fixes.some((f: string) => f.includes('cleared stale stale-provider')));
+
+    const after = JSON.parse(fs.readFileSync(QUOTA_FILE, 'utf-8'));
+    assert.strictEqual(after.providers['stale-provider'].rate_limited_until, undefined);
+    assert.strictEqual(after.providers['stale-provider'].rate_limited_model, undefined);
+    // A window the proxy still holds is left alone, and the rest of the file with it.
+    assert.strictEqual(after.providers['live-provider'].rate_limited_until, live);
+    assert.strictEqual(after.providers['live-provider'].remaining, 10);
+    assert.strictEqual(after.providers['live-provider'].total_cost, 2.25);
+    assert.strictEqual(after.providers['stale-provider'].total_cost, 1.5, 'unrelated fields are preserved');
+
+    // The `fixes` list is rendered as applied fixes, so it must only ever hold
+    // things that actually changed. It used to also carry a line telling the user
+    // which command to run, while `fixed` stayed 0.
+    for (const f of applied.fixes) {
+      assert.ok(!/answer the prompt/i.test(f), `advice must not be listed as a fix: ${f}`);
+    }
+  } finally {
+    fs.writeFileSync(QUOTA_FILE, quotaBackup, 'utf-8');
+  }
+});
+
+test('usageSummary survives a ledger that is not an array', () => {
+  const ledgerFile = path.join(comp, 'savings_ledger.json');
+  const original = fs.readFileSync(ledgerFile, 'utf-8');
+  try {
+    // readJson is a cast, not a validation: `for (const e of ledger)` used to throw
+    // on a hand-edited or half-written file and take the page/command down.
+    fs.writeFileSync(ledgerFile, JSON.stringify({ not: 'an array' }), 'utf-8');
+    const u = insights.usageSummary();
+    assert.strictEqual(u.ledger.entries, 0);
+    assert.ok(insights.searchQuery('anything'));
+  } finally {
+    fs.writeFileSync(ledgerFile, original, 'utf-8');
+  }
 });

@@ -57,8 +57,10 @@ export async function withRetry<T>(
   const p = { ...DEFAULT_RETRY_POLICY, ...policy };
   let lastError: unknown;
   let totalDelayMs = 0;
+  let made = 0;
   for (let attempt = 1; attempt <= p.maxRetries + 1; attempt++) {
-    if (signal?.aborted) return { ok: false, error: new Error('aborted'), attempts: attempt - 1, totalDelayMs };
+    if (signal?.aborted) return { ok: false, error: new Error('aborted'), attempts: made, totalDelayMs };
+    made = attempt;
     try {
       const value = await fn();
       return { ok: true, value, attempts: attempt, totalDelayMs };
@@ -72,7 +74,10 @@ export async function withRetry<T>(
       await sleep(delay, signal);
     }
   }
-  return { ok: false, error: lastError, attempts: p.maxRetries + 1, totalDelayMs };
+  // `made`, not `p.maxRetries + 1`: the loop also leaves through the two `break`s
+  // above, so a first-attempt 400 used to report 4 attempts — 3 requests that
+  // never happened.
+  return { ok: false, error: lastError, attempts: made, totalDelayMs };
 }
 
 function extractStatus(e: unknown): number | null {

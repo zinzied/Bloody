@@ -14,7 +14,9 @@
     "dev": "tsx src/index.tsx",
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --import tsx --test tests/*.test.ts"
+    "test": "node --import tsx --test tests/*.test.ts",
+    "check:encoding": "node scripts/check-encoding.mjs",
+    "verify": "npm run check:encoding && npm run typecheck && npm test"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",

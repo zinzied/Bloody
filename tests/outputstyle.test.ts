@@ -531,3 +531,81 @@ test('escalation settings are read from config even without an explicit set', ()
   assert.deepStrictEqual(proxy.outputStyleEscalation().at, [1234, 4321]);
   proxy.saveConfig(prev);
 });
+
+test('the style cycle covers every ladder rung, so cycling cannot jump families', () => {
+  const order = prompts.outputStyleCycle();
+  // Derived from the ladders: every rung of every family, mildest first, then off.
+  assert.deepStrictEqual(order, [
+    'caveman-lite',
+    'caveman-full',
+    'caveman-ultra',
+    'caveman-wenyan-lite',
+    'caveman-wenyan',
+    'caveman-wenyan-ultra',
+    'ponytail-lite',
+    'ponytail-full',
+    'ponytail-ultra',
+    'off',
+  ]);
+  // Every label must resolve back to a real setting, or the cycle would persist
+  // a value the proxy cannot apply.
+  for (const label of order) {
+    assert.strictEqual(prompts.resolveOutputStyle(label).label, label, `${label} must round-trip`);
+  }
+});
+
+test('nextOutputStyle advances one rung and wraps at the ends', () => {
+  assert.strictEqual(prompts.nextOutputStyle('caveman-lite'), 'caveman-full');
+  assert.strictEqual(prompts.nextOutputStyle('caveman-wenyan'), 'caveman-wenyan-ultra');
+  // The regression: the old hand-written list held 4 of these 10 labels, so
+  // indexOf() returned -1 and (-1 + 1) % 4 landed on caveman-lite, silently
+  // switching a ponytail user to caveman.
+  assert.strictEqual(prompts.nextOutputStyle('ponytail-full'), 'ponytail-ultra');
+  assert.strictEqual(prompts.nextOutputStyle('ponytail-ultra'), 'off');
+  assert.strictEqual(prompts.nextOutputStyle('off'), 'caveman-lite');
+  assert.strictEqual(prompts.nextOutputStyle('caveman-ultra'), 'caveman-wenyan-lite');
+  // Anything unrecognised starts the cycle instead of jumping to an arbitrary rung.
+  assert.strictEqual(prompts.nextOutputStyle('nonsense'), 'caveman-lite');
+  assert.strictEqual(prompts.nextOutputStyle(null), 'caveman-lite');
+  assert.strictEqual(prompts.nextOutputStyle(''), 'caveman-lite');
+});
+
+test('proxy.nextOutputStyle walks the saved level, not the default', () => {
+  const prev = proxy.loadConfig();
+  try {
+    proxy.saveConfig({ ...prev, output_style: 'ponytail-full' });
+    proxy.setOutputStyle(undefined);
+    assert.strictEqual(proxy.nextOutputStyle(), 'ponytail-ultra');
+  } finally {
+    proxy.saveConfig(prev);
+    proxy.setOutputStyle(undefined);
+  }
+});
+test('setting thresholds is a request to retune the ladder, so it turns escalation on', () => {
+  const prev = proxy.loadConfig();
+  const prevEnv = process.env.TOKENSAVER_OUTPUT_STYLE_ESCALATE;
+  delete process.env.TOKENSAVER_OUTPUT_STYLE_ESCALATE;
+  try {
+    // Start pinned off, as `escalate off` leaves it.
+    proxy.saveConfig({ ...prev, output_style_escalate: false, output_style_escalate_at: [20000, 60000] });
+    proxy.setOutputStyleEscalation(false);
+    assert.strictEqual(proxy.outputStyleEscalation().enabled, false);
+
+    // This is the call the CLI used to make when given bare thresholds, and why
+    // it reported "on" while persisting "off": with `enabled` omitted the flag is
+    // re-derived from the saved config, so the new thresholds were stored inert.
+    const rederived = proxy.setOutputStyleEscalation(undefined, ['10000', '40000']);
+    assert.strictEqual(rederived.enabled, false, 'the re-derived flag still reads the saved config');
+    assert.deepStrictEqual(rederived.at, [10000, 40000]);
+
+    const next = proxy.setOutputStyleEscalation(true, ['10000', '40000']);
+    assert.strictEqual(next.enabled, true);
+    assert.deepStrictEqual(next.at, [10000, 40000]);
+    assert.strictEqual(proxy.outputStyleEscalation().enabled, true);
+  } finally {
+    if (prevEnv === undefined) delete process.env.TOKENSAVER_OUTPUT_STYLE_ESCALATE;
+    else process.env.TOKENSAVER_OUTPUT_STYLE_ESCALATE = prevEnv;
+    proxy.saveConfig(prev);
+    proxy.setOutputStyleEscalation(undefined);
+  }
+});

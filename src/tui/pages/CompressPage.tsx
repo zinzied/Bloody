@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useRef, useEffect } from 'react';
 import { Box, Text } from 'ink';
 import { Page, Row, Stat, Hint, ErrorLine, TextField, Badge, fmt, Spinner } from '../components.js';
 import { useScreenInput } from '../input.js';
@@ -51,6 +51,10 @@ export function CompressPage() {
   const [filePath, setFilePath] = useState('');
   const [filterIdx, setFilterIdx] = useState(0); // 0=auto
   const [tokenMode, setTokenMode] = useState<'accurate' | 'heuristic' | 'both'>('both');
+  const loadTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (loadTimer.current) clearTimeout(loadTimer.current);
+  }, []);
 
   const filterName = FILTER_NAMES[filterIdx] || 'auto';
 
@@ -111,7 +115,10 @@ export function CompressPage() {
     if (k.input === 'l') {
       const sample = filterIdx % 2 === 0 ? SAMPLE_GIT_DIFF : SAMPLE_BUILD_LOG;
       setText(sample);
-      setTimeout(() => run(sample), 10);
+      // Deferred so the re-render lands first, and cancelled on unmount so the
+      // deferred `run` can't call setState on a page the user already left.
+      const t = setTimeout(() => run(sample), 10);
+      loadTimer.current = t;
       return true;
     }
     if (k.input === 'c' && result) {

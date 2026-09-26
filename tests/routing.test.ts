@@ -110,3 +110,43 @@ test('TieredRouter builds model chain and rotates accounts', () => {
   assert.strictEqual(missingId, null);
   assert.strictEqual(missingAcc, null);
 });
+
+test('a permanent client error neither falls back nor cools the account down', () => {
+  // These statuses have no rule of their own, and the catch-all used to treat
+  // every one of them as transient: should_fallback true plus a 30s cooldown, so
+  // a malformed request evicted a healthy key and moved on to a provider that
+  // would reject the identical body.
+  for (const status of [400, 405, 413, 422]) {
+    const r = routing.check_fallback_error(status, 'something went wrong');
+    assert.strictEqual(r.should_fallback, false, `${status} must not trigger a fallback`);
+    assert.strictEqual(r.cooldown_ms, 0, `${status} must not put the account in a cooldown`);
+  }
+  // The transient client statuses still do fall back.
+  for (const status of [408, 409, 425, 429]) {
+    assert.strictEqual(routing.check_fallback_error(status, '').should_fallback, true, `${status} stays transient`);
+  }
+  // And a server error is still treated as worth retrying elsewhere.
+  const five = routing.check_fallback_error(500, 'something exploded');
+  assert.strictEqual(five.should_fallback, true);
+  assert.ok(five.cooldown_ms > 0);
+  // The rules that do exist are untouched: an auth failure is the account's fault.
+  assert.strictEqual(routing.check_fallback_error(401, '').should_fallback, true);
+  assert.strictEqual(routing.check_fallback_error(404, '').should_fallback, true);
+});
+
+test('an expired cooldown is reported as active, matching get_active_accounts', () => {
+  const am = new routing.AccountManager();
+  // Its own provider, so accounts left behind by the test above cannot change
+  // the counts.
+  const id = am.add_account('cooldown-probe', 'key-expired', null, 0);
+  am.mark_error(id, 429, '');
+  assert.strictEqual(am.get_summary().find((s) => s.id === id)!.status, 'rate_limited');
+  assert.deepStrictEqual(am.get_active_accounts('cooldown-probe'), [], 'held back while the window is open');
+
+  // Nothing expires the marker on its own, so the summary used to keep reporting
+  // rate_limited forever while the selection path had long since freed the key.
+  const accounts: any = (am as any)._accounts;
+  accounts.accounts.find((a: any) => a.id === id).rate_limited_until = new Date(Date.now() - 1000).toISOString();
+  assert.strictEqual(am.get_summary().find((s) => s.id === id)!.status, 'active');
+  assert.strictEqual(am.get_active_accounts('cooldown-probe').length, 1, 'and the account is selectable again');
+});

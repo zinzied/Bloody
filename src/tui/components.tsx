@@ -5,9 +5,12 @@ import { useScreenInput, type KeyEvent } from './input.js';
 import { theme } from './theme.js';
 
 export const fmt = (n: unknown): string => {
+  // Checked before Number(): `Number(null)` and `Number('')` are both 0, so a
+  // missing value used to print as a real measurement of zero.
+  if (n === null || n === undefined || n === '') return '—';
   const num = Number(n);
   if (Number.isFinite(num)) return num.toLocaleString();
-  return n === null || n === undefined || n === '' ? '—' : String(n);
+  return String(n);
 };
 
 export const price = (m: { is_free?: boolean; input_price?: number; output_price?: number } | null | undefined): string => {
@@ -165,18 +168,20 @@ function padVisible(text: string, width: number): string {
   return text + ' '.repeat(Math.max(0, width - vw));
 }
 
-function renderCell(cellValue: Cell, width: number, isHead: boolean): ReactNode {
+function renderCell(cellValue: Cell, width: number, isHead: boolean, key: React.Key): ReactNode {
   const text = isHead ? cellValue.text.toUpperCase() : cellValue.text;
   const padded = padVisible(text, width + 2);
+  // Keyed by position, not by content: cells in one row are siblings, and a row
+  // like quota `total`/`remaining` can hold the same text twice.
   if (isHead) {
     return (
-      <Text key={`${cellValue.text}-${width}`} bold color={theme.accent}>
+      <Text key={key} bold color={theme.accent}>
         {padded}
       </Text>
     );
   }
   return (
-    <Text key={`${cellValue.text}-${width}`} color={cellValue.color || undefined} bold={cellValue.bold}>
+    <Text key={key} color={cellValue.color || undefined} bold={cellValue.bold}>
       {padded}
     </Text>
   );
@@ -190,10 +195,10 @@ export function Table({ head, rows }: { head: string[]; rows: Cell[][] }) {
   const heads = head.map((h) => ({ text: h })) as Cell[];
   return (
     <Box flexDirection="column">
-      <Box flexDirection="row">{heads.map((c, i) => renderCell(c, widths[i], true))}</Box>
+      <Box flexDirection="row">{heads.map((c, i) => renderCell(c, widths[i], true, i))}</Box>
       {rows.map((r, i) => (
         <Box key={i} flexDirection="row">
-          {r.map((c, j) => renderCell(c, widths[j], false))}
+          {r.map((c, j) => renderCell(c, widths[j], false, j))}
         </Box>
       ))}
     </Box>
@@ -262,7 +267,12 @@ export function Form({
   onCancel: () => void;
 }) {
   const [step, setStep] = React.useState(0);
-  const [values, setValues] = React.useState<string[]>(fields.map(() => ''));
+  // Seeded from the live values: the form is an editor, so it has to show what it
+  // is editing. It used to seed every field with '', and the submit path then
+  // wrote that '' back through each setter — which for the numeric policy fields
+  // meant `Number('')`, i.e. saving `daily_budget_usd: 0` because the user only
+  // retyped the one field they cared about.
+  const [values, setValues] = React.useState<string[]>(() => fields.map((f) => f.get()));
   return (
     <Box flexDirection="column" marginTop={1}>
       <Text bold color="yellow">

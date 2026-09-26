@@ -1,5 +1,5 @@
 import * as config from './config.js';
-import { readJson } from './utils.js';
+import { readJson, writeJson } from './utils.js';
 import * as rtk from './filters/rtk.js';
 import * as routingMod from './routing.js';
 import { accountManager, resolveUpstream } from './proxy.js';
@@ -31,7 +31,12 @@ function openIndexDb(): SqliteDb | null {
 }
 
 export function usageSummary() {
-  const ledger = readJson<Array<Record<string, any>>>(config.LEDGER_PATH) || [];
+  // readJson is a cast, not a check: a hand-edited or half-written ledger that
+  // parses to an object made `for (const e of ledger)` throw and took the CLI
+  // command, the control API route and the TUI page down with it. The line below
+  // already guarded `pcfg.history` this way.
+  const rawLedger = readJson<Array<Record<string, any>>>(config.LEDGER_PATH);
+  const ledger = Array.isArray(rawLedger) ? rawLedger : [];
   const pcfg = readJson<Record<string, any>>(config.PROXY_CONFIG) || {};
   const history = Array.isArray(pcfg.history) ? pcfg.history : [];
 
@@ -90,12 +95,24 @@ export function usageSummary() {
     .slice(0, 10)
     .map((r) => ({ ...r, ts: r.ts ? new Date(r.ts).toLocaleString() : '' }));
 
+  // `total_saved_*` is the all-time running total, and recordHistory() increments
+  // it with the very same per-request value it appends to `history`. Adding the
+  // history sum on top counted every retained entry (the last 200) twice, so the
+  // headline saving was ~2x the truth and drifted as history was trimmed. Prefer
+  // the persisted total, and only fall back to the history sum for a proxy.json
+  // written before the totals existed.
+  const persistedTokens = pcfg.total_saved_tokens == null ? NaN : Number(pcfg.total_saved_tokens);
+  const persistedBytes = pcfg.total_saved_bytes == null ? NaN : Number(pcfg.total_saved_bytes);
+
   return {
     ledger: ledgerTotals,
     proxy: {
       requests,
-      saved_tokens: reqSavedTokens + (pcfg.total_saved_tokens || 0),
-      saved_bytes: reqSavedBytes + (pcfg.total_saved_bytes || 0),
+      saved_tokens: Number.isFinite(persistedTokens) && persistedTokens >= 0 ? persistedTokens : reqSavedTokens,
+      saved_bytes: Number.isFinite(persistedBytes) && persistedBytes >= 0 ? persistedBytes : reqSavedBytes,
+      // Nothing ever writes `frost_saved` or the frost total, so there is no
+      // double-count to avoid here yet; both terms are kept so the day one of
+      // them starts being recorded does not silently drop it.
       frost_saved: frostSaved + (pcfg.frost_total_saved_tokens || 0),
     },
     perModel: [...perModel.entries()]
@@ -271,7 +288,8 @@ export function searchQuery(q: string, limit?: number) {
     }
   }
 
-  const ledger = readJson<Array<Record<string, any>>>(config.LEDGER_PATH) || [];
+  const rawLedger = readJson<Array<Record<string, any>>>(config.LEDGER_PATH);
+  const ledger = Array.isArray(rawLedger) ? rawLedger : [];
   const lower = q.toLowerCase();
   for (const e of ledger) {
     const hay = [e.description, e.kind, e.metadata && JSON.stringify(e.metadata)].join(' ');
@@ -384,18 +402,14 @@ export function doctorSummary(opts: { fix?: boolean } = {}) {
 
   // quota rate limits
   const now = Date.now();
+  const staleProviders: string[] = [];
   for (const [pid, p] of Object.entries((quota.providers || {}) as Record<string, any>)) {
     const until = p.rate_limited_until ? Date.parse(p.rate_limited_until) : 0;
     if (until) {
       const remainingMs = until - now;
       if (remainingMs <= 0) {
         issues.push(`stale rate_limit ${pid} expired ${p.rate_limited_until} — should be cleared`);
-        if (opts.fix) {
-          delete (quota.providers as Record<string, any>)[pid].rate_limited_until;
-          delete (quota.providers as Record<string, any>)[pid].rate_limited_model;
-          fixed++;
-          fixes.push(`cleared stale ${pid}`);
-        }
+        if (opts.fix) staleProviders.push(pid);
       } else {
         issues.push(`rate_limited ${pid} until ${p.rate_limited_until} (${Math.ceil(remainingMs/1000)}s left)`);
       }
@@ -409,12 +423,11 @@ export function doctorSummary(opts: { fix?: boolean } = {}) {
     if (decision === 'blocked') {
       issues.push(`daily limit reached: ${bs.reason} — you chose "stay blocked", guard active (fallback ${bs.fallbackModel})`);
     } else if (decision === 'reset') {
-      fixes.push(`daily limit was answered with "reset" today (${bs.reason})`);
+      // A leftover answer from an older build; a reset is no longer persisted.
+      // Not a fix — nothing was changed here.
+      issues.push(`daily limit was answered with "reset" today (${bs.reason})`);
     } else {
       issues.push(`daily limit reached: ${bs.reason} — choose 'budget reset' to keep your configured model or 'budget block' to stay blocked`);
-    }
-    if (opts.fix && decision !== 'blocked') {
-      fixes.push(`answer the prompt with 'token-saver budget reset' (reset counters) or 'token-saver budget block' (stay blocked)`);
     }
   }
   // tokenizer
@@ -427,11 +440,29 @@ export function doctorSummary(opts: { fix?: boolean } = {}) {
   // auth
   const working = new Set(config.get_working_providers());
   if (!working.size) issues.push('no working providers — check auth / env keys (opencode auth list)');
-  if (opts.fix && fixed) {
+  if (opts.fix && staleProviders.length) {
+    // Re-read immediately before writing and re-check each provider: the running
+    // proxy holds this same file in memory and rewrites all of it on every quota
+    // update, so writing the snapshot taken at the top of this function discarded
+    // any rate limit recorded in between. Only markers that are *still* expired
+    // are removed, so a window the proxy has just extended is left alone.
     try {
-      const { writeJson } = require('./utils.js') as typeof import('./utils.js');
-      (writeJson as any)(config.QUOTA_TRACKER_PATH, quota);
-      fixes.push(`wrote ${config.QUOTA_TRACKER_PATH}`);
+      const fresh = readJson<Record<string, any>>(config.QUOTA_TRACKER_PATH) || { providers: {}, accounts: {} };
+      const live = (fresh.providers || {}) as Record<string, any>;
+      const at = Date.now();
+      for (const pid of staleProviders) {
+        const entry = live[pid];
+        if (!entry || !entry.rate_limited_until) continue;
+        if (Date.parse(entry.rate_limited_until) > at) continue;
+        delete entry.rate_limited_until;
+        delete entry.rate_limited_model;
+        fixed++;
+        fixes.push(`cleared stale ${pid}`);
+      }
+      if (fixed) {
+        writeJson(config.QUOTA_TRACKER_PATH, fresh);
+        fixes.push(`wrote ${config.QUOTA_TRACKER_PATH}`);
+      }
     } catch {}
   }
 

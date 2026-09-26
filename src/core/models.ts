@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import * as config from './config.js';
+import { writeJson } from './utils.js';
 import type {
   ProviderCatalog,
   ProviderGroup,
@@ -50,14 +51,24 @@ export async function fetchCatalog(): Promise<CatalogFetchResult> {
       } catch {}
     }
   }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  let data: CatalogData;
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 15000);
     const resp = await fetch('https://models.dev/api.json', { signal: controller.signal });
-    clearTimeout(timer);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = (await resp.json()) as CatalogData;
-    fs.writeFileSync(config.CACHE_PATH, JSON.stringify(data), 'utf-8');
+    data = (await resp.json()) as CatalogData;
+  } finally {
+    // Cleared in a finally, not after the await: when fetch itself rejected
+    // (offline, DNS, TLS) the 15s timer stayed armed and held the event loop
+    // open, so the CLI sat there for up to 15s after printing its error.
+    clearTimeout(timer);
+  }
+  try {
+    // Atomic, via the same tmp+rename every other writer in the repo uses — a
+    // crash mid-write used to leave a truncated cache, which reads back as "no
+    // catalog" and silently falls back to hardcoded defaults.
+    writeJson(config.CACHE_PATH, data, 0);
     const oldSnap = loadSnapshot();
     const newModels = oldSnap ? diffNewModels(oldSnap, data) : [];
     saveSnapshot(data);
@@ -93,7 +104,9 @@ export function loadSnapshot(): Record<string, string[]> | null {
 }
 
 export function saveSnapshot(catalog: CatalogData | null): void {
-  fs.writeFileSync(config.SNAPSHOT_PATH, JSON.stringify(buildSnapshot(catalog)), 'utf-8');
+  // Atomic for the same reason as the catalog cache: a truncated snapshot parses
+  // as null, and a null snapshot makes the next diff report no new models at all.
+  writeJson(config.SNAPSHOT_PATH, buildSnapshot(catalog), 0);
 }
 
 export function diffNewModels(oldSnap: Record<string, string[]>, catalog: CatalogData | null): NewModelInfo[] {

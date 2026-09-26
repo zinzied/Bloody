@@ -58,6 +58,7 @@ export function RoutingPage() {
   });
 
   function addAccount() {
+    setActionError('');
     try {
       const id = accountManager.add_account(provider.trim(), apiKey.trim() || null, baseUrl.trim() || null, Number(priority) || 0);
       setAdded(`Added ${id}`);

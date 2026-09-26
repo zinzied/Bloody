@@ -1,0 +1,7 @@
+# Keep line endings out of the working tree, so a Windows checkout and a Linux
+# one cannot disagree about a file's bytes — the disagreement shows up as a whole
+# file rewritten in a diff, and it is how a file ends up with mixed endings.
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf

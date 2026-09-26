@@ -85,15 +85,25 @@ export function loadLimitDecision(): LimitDecision | null {
 
 /**
  * Record the user's answer for today's reached limit.
- * `reset` also zeroes the daily counters so the configured model keeps working.
+ *
+ * `reset` zeroes the daily counters and deliberately does NOT persist a
+ * decision. It used to write `{choice:'reset'}`, and because a decision only
+ * expires when the UTC date rolls over, that single answer suppressed everything
+ * for the rest of the day: `choiceRequired` needs `!decision`, so the user was
+ * never asked again however much they spent, and `blockingActive` needs
+ * `choice === 'blocked'`, so the free-model guard could no longer be armed at
+ * all. "Reset" is an action, not a standing answer.
  */
 export function setLimitDecision(choice: LimitChoice): LimitDecision {
-  if (choice === 'reset') resetDailyCounters();
   const decision: LimitDecision = { date: todayISODate(), choice, decidedAt: nowIso() };
+  if (choice === 'reset') {
+    resetDailyCounters();
+    clearLimitDecision();
+    return decision;
+  }
   writeJson(LIMIT_DECISION_PATH, decision);
   return decision;
 }
-
 export function clearLimitDecision(): void {
   try {
     fs.unlinkSync(LIMIT_DECISION_PATH);
@@ -194,6 +204,10 @@ export function pickFreeFallbackModel(): string | null {
     const catalog = get_user_models_sync();
     const freeCandidates: { id: string; cost: number }[] = [];
     for (const g of Object.values(catalog)) {
+      // Only providers the user actually has credentials for. The guard reroutes
+      // the request here, so offering a free model behind a provider they never
+      // configured just moves the failure from "limit reached" to "no key".
+      if (!g.configured) continue;
       for (const m of g.models || []) {
         if (m.is_free) freeCandidates.push({ id: m.id, cost: 0 });
       }

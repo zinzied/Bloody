@@ -71,7 +71,11 @@ export function getHooksForPoint(
   if (!matchers || !Array.isArray(matchers)) return [];
   const results: HookCommand[] = [];
   for (const m of matchers) {
+    if (!m || typeof m !== 'object') continue;
     if (toolName && !matchesMatcher(toolName, m.matcher)) continue;
+    // A hand-written entry with no `hooks` array (an easy typo, and the file is
+    // user-authored JSON) used to throw here and abort the whole pass.
+    if (!Array.isArray(m.hooks)) continue;
     results.push(...m.hooks);
   }
   return results;

@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { nowIso, readJson, writeJson, ensureDir } from './utils.js';
-import { PROXY_CONFIG, CACHE_PATH, SAVER_POLICY_PATH, read_config, get_current_model, set_provider_base_urls, restore_provider_base_urls } from './config.js';
+import { PROXY_CONFIG, CACHE_PATH, SAVER_POLICY_PATH, read_config, read_merged_config, config_env_credential, find_original_provider_base_url, provider_id_key, provider_entry, get_current_model, set_provider_base_urls, restore_provider_base_urls } from './config.js';
 import { readCatalogCache, get_user_models_sync, model_total_cost } from './models.js';
 import * as rtk from './filters/rtk.js';
 import * as routing from './routing.js';
@@ -187,6 +187,11 @@ export function setOutputStyle(value?: string | null): prompts.OutputStyleSettin
   return _outputStyle;
 }
 
+/** The label a `cycle style` step should move to, given what is active now. */
+export function nextOutputStyle(): string {
+  return prompts.nextOutputStyle(outputStyle().label);
+}
+
 /**
  * Read the active settings from proxy.json exactly once.
  *
@@ -363,11 +368,25 @@ export function providerIdAliases(pid: string): string[] {
   return out;
 }
 
+/**
+ * A record entry for a provider id, tolerating the spelling differences between
+ * the config file, the auth store and the catalog.
+ *
+ * The alias list cannot carry case, because it is built from a lowercased id: a
+ * provider the user wrote as `MyProvider` was invisible to every lookup, so its
+ * base URL went unresolved and the proxy had nowhere to send the request. The
+ * normalized scan below is the fallback that makes those ids reachable.
+ */
 function lookupByProvider<T>(record: Record<string, T> | null | undefined, pid: string): T | undefined {
   if (!record || !pid) return undefined;
   for (const alias of providerIdAliases(pid)) {
     const v = record[alias];
     if (v !== undefined && v !== null && v !== '') return v;
+  }
+  const target = provider_id_key(pid);
+  if (!target) return undefined;
+  for (const [k, v] of Object.entries(record)) {
+    if (provider_id_key(k) === target && v !== undefined && v !== null && v !== '') return v;
   }
   return undefined;
 }
@@ -406,6 +425,18 @@ export function canonicalEndpoint(pathOnly: string): string {
   if (pathOnly.endsWith('/messages')) return '/messages';
   if (pathOnly.endsWith('/models')) return '/models';
   return pathOnly;
+}
+
+// Providers are rewritten to `http://127.0.0.1:<port>/p/<provider>/v1`, so a
+// request that comes back through the proxy names the provider it was meant for.
+// Without it, a model id that carries no provider prefix has to be guessed.
+const PROVIDER_PATH = /^\/p\/([A-Za-z0-9_.-]+)(?=\/|$)/;
+
+/** Split `/p/<provider>/v1/chat/completions` into the provider and the real path. */
+export function parse_provider_path(pathOnly: string): { pid: string; rest: string } {
+  const m = PROVIDER_PATH.exec(String(pathOnly || ''));
+  if (!m) return { pid: '', rest: String(pathOnly || '') };
+  return { pid: normalizeProviderId(m[1]), rest: pathOnly.slice(m[0].length) || '/' };
 }
 
 function isSelfUrl(url: string): boolean {
@@ -448,6 +479,12 @@ function apiKeyForProvider(pid: string): string {
       if (v && v.trim()) return v.trim();
     }
   }
+  // A provider declared in the user's own config may carry its credential as an
+  // `{env:VAR}` reference with no name we could guess, e.g. a local router.
+  for (const alias of aliases) {
+    const fromCfg = config_env_credential(alias);
+    if (fromCfg) return fromCfg;
+  }
   for (const file of authFilePaths()) {
     let auth: Record<string, any>;
     try {
@@ -456,7 +493,7 @@ function apiKeyForProvider(pid: string): string {
       continue;
     }
     for (const alias of aliases) {
-      const entry = auth[alias];
+      const entry = provider_entry(auth, alias);
       if (!entry || typeof entry !== 'object') continue;
       // OAuth entries hold an access/refresh token, not a provider API key.
       // Presenting one of those as a bearer credential is a guaranteed 401.
@@ -468,12 +505,68 @@ function apiKeyForProvider(pid: string): string {
   return '';
 }
 
+/**
+ * Drop a leading auth scheme so a raw credential can be compared and reused.
+ * `Authorization: Bearer sk-…` and `x-api-key: sk-…` have to look the same to
+ * the code that matches keys and re-applies them — reusing a `Bearer Bearer …`
+ * value is an instant 401.
+ */
+function stripAuthScheme(value: string): string {
+  const m = /^(Bearer|Basic|Token)\s+(.+)$/i.exec(String(value || '').trim());
+  return (m ? m[2] : String(value || '').trim()).trim();
+}
+
 /** The credential the client put on the request, if any. */
 function clientCredential(headers: http.IncomingHttpHeaders): string {
   for (const name of CREDENTIAL_HEADERS) {
     const raw = headers[name];
     const v = Array.isArray(raw) ? raw[0] : raw;
-    if (v && String(v).trim()) return String(v).trim();
+    if (v && String(v).trim()) return stripAuthScheme(String(v));
+  }
+  return '';
+}
+
+/**
+ * Which provider a credential belongs to — the reverse of apiKeyForProvider.
+ *
+ * A key is the strongest signal in a proxied request: it says who the caller
+ * authenticated as. When the model id carries no provider prefix we would
+ * otherwise guess, and a wrong guess sends the key to an upstream that rejects
+ * it with 401/403.
+ */
+export function providerForCredential(key: string): string {
+  if (!key) return '';
+  const bare = stripAuthScheme(key);
+  if (!bare) return '';
+  for (const [pid, envNames] of Object.entries(PROVIDER_ENV_KEYS)) {
+    for (const envName of envNames) {
+      const v = process.env[envName];
+      if (v && v.trim() === bare) return pid;
+    }
+  }
+  // Credentials declared as `{env:VAR}` inside the user's config, including
+  // local providers whose env var name is not guessable from the provider id.
+  // Without this a request for a local provider is unidentifiable, so routing
+  // falls through to a catalog guess that forwards the key to a third party.
+  for (const pid of configuredProviderIds()) {
+    for (const alias of providerIdAliases(pid)) {
+      const fromCfg = config_env_credential(alias);
+      if (fromCfg && fromCfg === bare) return normalizeProviderId(alias);
+    }
+  }
+  for (const file of authFilePaths()) {
+    let auth: Record<string, any>;
+    try {
+      auth = readJson<Record<string, any>>(file, {}) || {};
+    } catch {
+      continue;
+    }
+    for (const [pid, entry] of Object.entries(auth)) {
+      if (!entry || typeof entry !== 'object') continue;
+      if (entry.type && entry.type !== 'api') continue;
+      const stored = String(entry.api?.key ?? entry.key ?? '').trim();
+      if (stored && stored === bare) return normalizeProviderId(pid);
+    }
   }
   return '';
 }
@@ -569,7 +662,8 @@ export function pickHealthyFallback(excludeProvider: string): string | null {
   return null;
 }
 
-export function defaultUpstream(): { pid: string; base: string } {  const cfg = loadConfig();
+export function defaultUpstream(): { pid: string; base: string } {
+  const cfg = loadConfig();
   const candidates: string[] = [];
   for (const pid of cfg.proxied_providers || []) candidates.push(pid);
   for (const pid of Object.keys(cfg.saved_base_urls || {})) candidates.push(pid);
@@ -633,19 +727,116 @@ export function catalogProviderForModel(modelId: string): string {
   return pool[0];
 }
 
-export function resolveUpstream(modelId: string, pathOnly: string): { pid: string; url: string } {
-  const pid = modelProvider(modelId);
-  const base = pid ? providerBaseUrl(pid) : '';
-  if (base && !isSelfUrl(base)) return { pid, url: base + canonicalEndpoint(pathOnly) };
-  if (pid && !base) {
-    const catalogPid = catalogProviderForModel(modelId);
-    const catBase = catalogPid ? providerBaseUrl(catalogPid) : '';
-    if (catalogPid && catBase && !isSelfUrl(catBase)) {
-      return { pid: catalogPid, url: catBase + canonicalEndpoint(pathOnly) };
+/**
+ * Every provider id the user actually configured, across all of OpenCode's
+ * config files. Credential matching walks this list so a local provider is
+ * recognised by the key it declares rather than by a hardcoded env var name.
+ */
+export function configuredProviderIds(): string[] {
+  const out: string[] = [];
+  try {
+    const cfg = read_merged_config();
+    const prov = cfg?.provider;
+    if (prov && typeof prov === 'object') {
+      for (const pid of Object.keys(prov)) if (!out.includes(pid)) out.push(pid);
     }
+  } catch {}
+  const cfg = loadConfig();
+  for (const pid of cfg.proxied_providers || []) if (typeof pid === 'string' && !out.includes(pid)) out.push(pid);
+  for (const pid of Object.keys(cfg.saved_base_urls || {})) if (!out.includes(pid)) out.push(pid);
+  return out;
+}
+
+/** Whether `pid` names a provider we can actually reach. */
+function knownProvider(pid: string): boolean {
+  if (!pid) return false;
+  for (const alias of providerIdAliases(pid)) {
+    if (PROVIDER_BASE_URLS[alias]) return true;
+    if (providerBaseUrl(alias)) return true;
   }
+  return false;
+}
+
+/** A reachable base URL for `pid`, or '' when there isn't one. */
+function usableBaseUrl(pid: string): string {
+  const base = providerBaseUrl(pid);
+  if (!base || isSelfUrl(base)) return '';
+  return base.replace(/\/+$/, '');
+}
+
+export interface UpstreamHints {
+  /** Provider named by the `/p/<provider>` path the request came in on. */
+  pathProvider?: string;
+  /** Credential the client put on the request, if any. */
+  clientKey?: string;
+}
+
+/**
+ * Work out which upstream a request belongs to.
+ *
+ * The old order was: model prefix, else catalog, else "the first provider in
+ * the list". For a model id without a prefix — which is exactly what OpenCode
+ * sends, e.g. `big-pickle` — that fell through to a guess, and the guess sent
+ * the request plus the client's key to an unrelated upstream, which answered
+ * 401/403. The credential is now consulted before any guess, and `reason` says
+ * which rule decided it so the console log explains the route.
+ */
+export function resolveUpstream(
+  modelId: string,
+  pathOnly: string,
+  hints: UpstreamHints = {}
+): { pid: string; url: string; reason: string } {
+  const endpoint = canonicalEndpoint(pathOnly);
+
+  // 1. The path the client came in on names the provider outright.
+  for (const alias of providerIdAliases(hints.pathProvider || '')) {
+    const base = usableBaseUrl(alias);
+    if (base) return { pid: alias, url: base + endpoint, reason: 'path' };
+  }
+
+  const prefixPid = modelProvider(modelId);
+  const keyPid = providerForCredential(hints.clientKey || '');
+
+  // 2. A prefixed model id — unless the credential says the caller is someone
+  //    else, in which case the prefix is stale and the key is the truth.
+  if (knownProvider(prefixPid)) {
+    if (keyPid && keyPid !== prefixPid) {
+      const kb = usableBaseUrl(keyPid);
+      if (kb) return { pid: keyPid, url: kb + endpoint, reason: 'credential' };
+    }
+    const base = usableBaseUrl(prefixPid);
+    if (base) return { pid: prefixPid, url: base + endpoint, reason: 'model-prefix' };
+  }
+
+  // 3. The credential the client authenticated with.
+  const keyBase = usableBaseUrl(keyPid);
+  if (keyBase) return { pid: keyPid, url: keyBase + endpoint, reason: 'credential' };
+
+  // 4. The configured model, when the bare id is the one it points at.
+  const shortId = String(modelId || '').includes('/')
+    ? String(modelId).split('/').slice(1).join('/')
+    : String(modelId || '');
+  const current = get_current_model();
+  if (shortId && current && current.split('/').slice(1).join('/') === shortId) {
+    const curPid = current.split('/')[0];
+    const curBase = usableBaseUrl(curPid);
+    if (curBase) return { pid: curPid, url: curBase + endpoint, reason: 'current-model' };
+  }
+
+  // 5. The models.dev catalog — but never for a provider the client named
+  //    explicitly. If that provider has no usable upstream, guessing here sends
+  //    the caller's key to a third-party gateway that answers "invalid api key"
+  //    for it, which is both the wrong answer and a credential leak. Report the
+  //    real problem instead so the caller can surface `no_upstream`.
+  const named = normalizeProviderId(hints.pathProvider || '');
+  if (named) return { pid: named, url: '', reason: 'no-upstream-for-named-provider' };
+
+  const catalogPid = catalogProviderForModel(modelId);
+  const catBase = catalogPid ? usableBaseUrl(catalogPid) : '';
+  if (catalogPid && catBase) return { pid: catalogPid, url: catBase + endpoint, reason: 'catalog' };
+
   const def = defaultUpstream();
-  return { pid: def.pid, url: def.base + canonicalEndpoint(pathOnly) };
+  return { pid: def.pid, url: def.base + endpoint, reason: 'default' };
 }
 
 function pickHeaders(headers: http.IncomingHttpHeaders): Record<string, string> {
@@ -716,6 +907,13 @@ function computeTokenSavings(rawBody: string, outBody: string): { rawTokens: num
   return { rawTokens, outTokens, savedTokens: Math.max(0, rawTokens - outTokens) };
 }
 
+/** What one proxied request cost, so the caller can log it without re-tokenizing. */
+interface RequestUsage {
+  rawTokens: number;
+  outTokens: number;
+  costUSD: number;
+}
+
 function recordHistory(
   pathOnly: string,
   modelId: string,
@@ -724,7 +922,7 @@ function recordHistory(
   rawBody: string,
   outBody: string,
   style: AppliedStyle | null = null
-): void {
+): RequestUsage | null {
   try {
     const cfg = loadConfig();
     const { rawTokens, outTokens } = computeTokenSavings(rawBody, outBody);
@@ -755,12 +953,24 @@ function recordHistory(
       total_saved_tokens: (Number(cfg.total_saved_tokens) || 0) + savedTokens,
     });
     index.logProxyRequest(pathOnly, modelId || 'unknown', rawTokens, savedTokens);
-    // record daily budget spend (estimate cost from input tokens)
+    // Daily budget spend. Both calls used to be handed 0 for the output side, so
+    // the reported spend ignored every reply — and replies are the expensive half
+    // (output_price is typically several times input_price), which meant
+    // `daily_budget_usd` almost never tripped and `tokensOut` stayed 0 forever.
+    let costUSD = 0;
     try {
-      const cost = budget.estimateCostForRequest(rawTokens, 0, modelId);
-      budget.recordDailySpend({ cost, tokensIn: rawTokens, tokens: rawTokens });
+      costUSD = budget.estimateCostForRequest(rawTokens, outTokens, modelId);
+      budget.recordDailySpend({ cost: costUSD, tokensIn: rawTokens, tokensOut: outTokens, tokens: rawTokens });
     } catch {}
-  } catch {}
+    return { rawTokens, outTokens, costUSD };
+  } catch {
+    return null;
+  }
+}
+
+/** Human-readable "provider -> base url", for the routing log line. */
+function upstreamProviderLabel(resolved: { pid: string; url: string }): string {
+  return `${resolved.pid || '?'} -> ${resolved.url}`;
 }
 
 function forward(
@@ -775,19 +985,31 @@ function forward(
   account: routing.Account | null,
   credentialKey: string,
   upstreamProvider: string,
-  style: AppliedStyle | null = null
+  style: AppliedStyle | null = null,
+  clientKeyUsable = true
 ): void {
   const u = new URL(upstreamUrl);
   const transport = u.protocol === 'https:' ? https : http;
 
+  // The credential actually in play, and where it came from. A key the proxy
+  // chose can be stale; the one the client sent is the ground truth, so it is
+  // kept around to retry with when upstream answers 401/403.
+  const clientKey = clientCredential(req.headers);
+  let activeKey = credentialKey;
+  let keySource = credentialKey ? 'proxy' : clientKey ? 'client' : 'none';
+
   function pick(): Record<string, string> {
     const headers = pickHeaders(req.headers);
-    if (credentialKey) applyCredential(headers, upstreamProvider, credentialKey);
+    if (activeKey) applyCredential(headers, upstreamProvider, activeKey);
     return headers;
   }
 
-  function finish(statusCode: number, upRes: http.IncomingMessage | null): void {
-    const provider = modelProvider(modelId);
+  function finish(statusCode: number, upRes: http.IncomingMessage | null, usage: RequestUsage | null = null): void {
+    // The provider we resolved, not one split off the model string: for a bare
+    // model id (`big-pickle`) that split yields the model's own name, and the
+    // quota and cooldown state would be filed under a provider that does not
+    // exist — which then makes an unrelated provider look rate-limited.
+    const provider = upstreamProvider || modelProvider(modelId);
     try {
       if (statusCode >= 400) {
         if (statusCode === 429) {
@@ -820,7 +1042,18 @@ function forward(
             account_id: account && account.id,
           });
         }
-        quotaTracker.log_request(provider, modelId, 0, 0, 0, account && account.id);
+        // The real token counts and cost, measured once by recordHistory(). These
+        // were hardcoded zeros, so the per-provider cost column on the Quota and
+        // Routing screens read $0.0000 no matter how much was spent.
+        quotaTracker.log_request(
+          provider,
+          modelId,
+          usage ? usage.rawTokens : 0,
+          usage ? usage.outTokens : 0,
+          usage ? usage.costUSD : 0,
+          account && account.id
+        );
+
       }
     } catch {}
     if (!account) return;
@@ -830,13 +1063,37 @@ function forward(
     } catch {}
   }
 
-  function send(body: string): void {
+  function send(body: string, authRetried = false): void {
     const headers = pick();
     headers['Content-Length'] = String(Buffer.byteLength(body));
     const upReq = transport.request(
       u,
       { method: 'POST', headers },
       (upRes) => {
+        const code = upRes.statusCode || 0;
+        // Upstream rejected a credential the proxy picked. If the client sent a
+        // different one, that one is the fresh one — use it rather than surfacing
+        // an auth error whose cause the user cannot see.
+        //
+        // Two cases must NOT retry: when the proxy forwarded the client's own
+        // header untouched (the retry would send the byte-identical request and
+        // earn the same 401), and after a reroute, where the client's key belongs
+        // to the provider we just moved away from and would leak it upstream.
+        const canRetryWithClientKey = clientKeyUsable && !!credentialKey && !!clientKey && clientKey !== credentialKey;
+        if (!authRetried && canRetryWithClientKey && (code === 401 || code === 403)) {
+          upRes.resume();
+          console.log(
+            `[auth] ${code} from ${upstreamUrl} with the ${keySource === 'proxy' ? 'proxy-held' : 'routed'} key — retrying with the client's own credential`
+          );
+          activeKey = clientKey;
+          keySource = 'client';
+          return send(body, true);
+        }
+        if (code === 400 || code === 401 || code === 403) {
+          console.log(
+            `[auth] ${code} from ${upstreamUrl} — provider=${upstreamProvider || '?'} model=${modelId || '?'} key=${keySource}`
+          );
+        }
         if (upRes.statusCode === 400 && body !== rawBody) {
           upRes.resume();
           const retryReq = transport.request(
@@ -844,8 +1101,8 @@ function forward(
             { method: 'POST', headers: { ...pick(), 'Content-Length': String(Buffer.byteLength(rawBody)) } },
             (res2) => {
               streamBack(res2, res);
-              recordHistory(pathOnly, modelId, stats, upstreamUrl, rawBody, outBody, null);
-              finish(res2.statusCode || 0, res2);
+              const usage = recordHistory(pathOnly, modelId, stats, upstreamUrl, rawBody, outBody, null);
+              finish(res2.statusCode || 0, res2, usage);
             }
           );
           retryReq.on('error', () => {
@@ -860,8 +1117,8 @@ function forward(
           return;
         }
         streamBack(upRes, res);
-        recordHistory(pathOnly, modelId, stats, upstreamUrl, rawBody, outBody, style);
-        finish(upRes.statusCode || 0, upRes);
+        const usage = recordHistory(pathOnly, modelId, stats, upstreamUrl, rawBody, outBody, style);
+        finish(upRes.statusCode || 0, upRes, usage);
       }
     );
     upReq.on('error', () => {
@@ -879,12 +1136,22 @@ function forward(
   send(outBody);
 }
 
-function forwardGet(req: http.IncomingMessage, res: http.ServerResponse, pathOnly: string): void {
-  const def = defaultUpstream();
-  const url = def.base + canonicalEndpoint(pathOnly);
+function forwardGet(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  pathOnly: string,
+  hints: UpstreamHints = {}
+): void {
+  // The model list has to come from the same upstream the chat requests go to,
+  // or the client shows models the provider it is talking to does not serve.
+  const resolved = resolveUpstream('', pathOnly, hints);
+  const url = resolved.url;
   const u = new URL(url);
   const transport = u.protocol === 'https:' ? https : http;
-  const upReq = transport.request(u, { method: 'GET', headers: pickHeaders(req.headers) }, (upRes) =>
+  const headers = pickHeaders(req.headers);
+  const key = clientCredential(req.headers) || apiKeyForProvider(resolved.pid);
+  if (key) applyCredential(headers, resolved.pid, key);
+  const upReq = transport.request(u, { method: 'GET', headers }, (upRes) =>
     streamBack(upRes, res)
   );
   upReq.on('error', () => {
@@ -898,7 +1165,13 @@ function forwardGet(req: http.IncomingMessage, res: http.ServerResponse, pathOnl
 }
 
 async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-  const pathOnly = (req.url || '').split('?')[0];
+  const rawPath = (req.url || '').split('?')[0];
+  // `/p/<provider>/...` is ours, not the upstream's: drop it before anything
+  // else looks at the path, and remember which provider the client came in on.
+  const parsed = parse_provider_path(rawPath);
+  const pathProvider = parsed.pid;
+  const pathOnly = parsed.rest;
+  const incomingKey = clientCredential(req.headers);
 
   // Control API /api/* (before any LLM traffic handling)
   if (pathOnly.startsWith('/api/')) {
@@ -910,7 +1183,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     return respondJson(res, 200, status());
   }
   if (req.method === 'GET' && pathOnly.endsWith('/models')) {
-    return forwardGet(req, res, pathOnly);
+    return forwardGet(req, res, pathOnly, { pathProvider, clientKey: incomingKey });
   }
   if (req.method !== 'POST') {
     return respondJson(res, 405, {
@@ -931,6 +1204,14 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     } catch {}
 
     let modelId = (data && (data.model || '')) || '';
+    // The provider the client meant, before anything is rerouted. A bare model
+    // id (`big-pickle`) has no provider prefix, so splitting it would yield the
+    // model name as a provider name — every per-provider decision (rate limits,
+    // accounts) has to be made against the real one.
+    const requestedProvider =
+      pathProvider ||
+      (knownProvider(modelProvider(modelId)) ? modelProvider(modelId) : '') ||
+      providerForCredential(incomingKey);
     if (data && typeof data.model === 'string' && data.model.includes('/')) {
       const prefix = data.model.split('/', 1)[0];
       if (prefix && (providerBaseUrl(prefix) || prefix === 'opencode' || prefix === 'opencode_go' || prefix === 'opencode-go')) {
@@ -952,7 +1233,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
           const fallbackShort = check.fallbackModel.includes('/') ? check.fallbackModel.split('/').slice(1).join('/') : check.fallbackModel;
           const currentShort = String(data.model || modelId).split('/').pop() || '';
           const fallbackProvider = check.fallbackModel.split('/')[0];
-          const currentProvider = modelProvider(modelId);
+          const currentProvider = requestedProvider;
           // enforce if different provider or different model
           if (fallbackShort !== currentShort || fallbackProvider !== currentProvider) {
             enforcedFallback = check.fallbackModel;
@@ -979,7 +1260,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     let rateLimitReroutedFrom: string | null = null;
     if (data && !budgetEnforced && process.env.TOKENSAVER_RATELIMIT_FALLBACK !== '0') {
       try {
-        const reqProvider = modelProvider(modelId);
+        const reqProvider = requestedProvider;
         if (reqProvider && quotaTracker.is_rate_limited(reqProvider)) {
           const fb = pickHealthyFallback(reqProvider);
           if (fb) {
@@ -998,7 +1279,11 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         }
       } catch {}
     }
-    const resolved = resolveUpstream(modelId, pathOnly);
+    // A reroute is a deliberate decision made above: it picks the provider AND
+    // the key, so the path the client came in on must not pull the request back
+    // to the provider that was just rejected.
+    const rerouted = !!rateLimitReroutedFrom || budgetEnforced;
+    const resolved = resolveUpstream(modelId, pathOnly, rerouted ? {} : { pathProvider, clientKey: incomingKey });
     let upstreamUrl = resolved.url;
     if (!upstreamUrl) {
       return respondJson(res, 502, {
@@ -1009,10 +1294,14 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         },
       });
     }
+    console.log(`[route] ${modelId || '(no model)'} → ${upstreamProviderLabel(resolved)} [${resolved.reason}]`);
 
     let account: routing.Account | null = null;
     try {
-      const provider = modelProvider(modelId);
+      // The provider we actually resolved, not the one guessed from the model
+      // string: for a bare model id those differ, and an account's key and
+      // base_url only mean anything for the provider they were saved under.
+      const provider = resolved.pid || modelProvider(modelId);
       const strategy = loadConfig().account_strategy || 'round-robin';
       account = accountManager.select_account(provider, strategy, 1, modelId);
       if (account && account.base_url) {
@@ -1024,7 +1313,6 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     // header, then whatever we hold locally for the provider we are actually
     // calling. A reroute changes the receiving provider, so the client's key is
     // no longer valid for it and must be replaced.
-    const rerouted = !!rateLimitReroutedFrom || budgetEnforced;
     let credentialKey = '';
     try {
       if (account && account.api_key) {
@@ -1089,7 +1377,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       }
     }
 
-    forward(req, res, upstreamUrl, outBody, raw, pathOnly, modelId, stats, account, credentialKey, resolved.pid, appliedStyle);
+    forward(req, res, upstreamUrl, outBody, raw, pathOnly, modelId, stats, account, credentialKey, resolved.pid, appliedStyle, !rerouted);
   });
 }
 
@@ -1185,13 +1473,15 @@ export interface ProxifyResult {
 export function ensureProxiedProviders(port?: number, rewriteConfig = false): ProxifyResult {
   const cfg = loadConfig();
   const targetPort = port !== undefined && port !== null ? port : cfg.port || DEFAULT_PORT;
-  const proxyUrl = `http://127.0.0.1:${targetPort}/v1`;
+  // Each provider is pointed at its own path under the proxy root, so requests
+  // arriving through it still say which provider they belong to.
+  const proxyUrl = `http://127.0.0.1:${targetPort}`;
 
   const set = new Set<string>();
   for (const pid of cfg.proxied_providers || []) set.add(pid);
   for (const pid of Object.keys(cfg.saved_base_urls || {})) set.add(pid);
   for (const pid of Object.keys(cfg.upstreams || {})) set.add(pid);
-  const opencfg = read_config();
+  const opencfg = read_merged_config();
   if (opencfg && typeof opencfg.provider === 'object') {
     for (const pid of Object.keys(opencfg.provider)) set.add(pid);
   }
@@ -1210,7 +1500,31 @@ export function ensureProxiedProviders(port?: number, rewriteConfig = false): Pr
       ? String((opencfg.provider[pid].options || {}).baseURL || '').replace(/\/+$/, '')
       : '';
     if (base && /127\.0\.0\.1:\d+|localhost:\d+/.test(base)) {
-      already.push(pid);
+      // A loopback upstream: either this proxy already, or a local server of the
+      // user's own (a router, ollama) that is about to be pointed at the proxy.
+      const ours = new RegExp(`127\\.0\\.0\\.1:${targetPort}(/|$)|localhost:${targetPort}(/|$)`).test(base);
+      let upstream = base;
+      if (ours) {
+        // A custom local provider has no entry in PROVIDER_BASE_URLS, so the
+        // hardcoded table cannot recover it. Look in the other config files and
+        // the rotated backups, which still hold the pre-proxy address.
+        upstream =
+          PROVIDER_BASE_URLS[normalizeProviderId(pid)] || find_original_provider_base_url(pid, targetPort) || '';
+      }
+      // Either way the upstream has to be on record: the config is pointing at
+      // the proxy, and without a saved upstream the proxy has nowhere to send
+      // the request and answers `no_upstream` for every call.
+      if (!upstream || cfg.saved_base_urls?.[pid] || cfg.upstreams?.[pid]) {
+        already.push(pid);
+        continue;
+      }
+      cfg.saved_base_urls = cfg.saved_base_urls || {};
+      cfg.upstreams = cfg.upstreams || {};
+      cfg.saved_base_urls[pid] = upstream;
+      cfg.upstreams[pid] = upstream;
+      if (!cfg.proxied_providers) cfg.proxied_providers = [];
+      if (!cfg.proxied_providers.includes(pid)) cfg.proxied_providers.push(pid);
+      added.push(pid);
       continue;
     }
     if (!base) base = PROVIDER_BASE_URLS[pid] || '';

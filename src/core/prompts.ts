@@ -459,6 +459,31 @@ export function styleLadder(setting: OutputStyleSetting): string[] | null {
   return OUTPUT_STYLE_LADDERS[`${setting.style}${register}`] || null;
 }
 
+/**
+ * Every selectable level label, mildest → most aggressive, then `off`.
+ *
+ * Derived from the ladders so a new rung cannot be added without appearing here.
+ * A hand-written list had drifted: it named 4 of the 10 valid labels, so cycling
+ * from e.g. `ponytail-full` hit `indexOf() === -1` and jumped to `caveman-lite`,
+ * silently swapping style family.
+ */
+export function outputStyleCycle(): string[] {
+  const out: string[] = [];
+  for (const [key, levels] of Object.entries(OUTPUT_STYLE_LADDERS)) {
+    const family = key.split(':')[0];
+    for (const level of levels) out.push(`${family}-${level}`);
+  }
+  out.push('off');
+  return out;
+}
+
+/** The label after `current` in the cycle; an unknown label starts the cycle. */
+export function nextOutputStyle(current?: string | null): string {
+  const order = outputStyleCycle();
+  const at = order.indexOf(current || '');
+  return order[(at + 1) % order.length];
+}
+
 /** Sanitize a user/config threshold list: positive, ascending, at most ladder length. */
 export function resolveEscalateAt(value?: unknown): number[] {
   const raw = Array.isArray(value) ? value : typeof value === 'string' ? value.split(',') : [];

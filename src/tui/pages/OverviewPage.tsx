@@ -24,7 +24,7 @@ export function OverviewPage() {
             <Stat label="Proxy tokens saved" value={fmt(p.proxy.saved_tokens)} />
           </Row>
           <Row>
-            <Meter value={p.proxy.saved_tokens || 0} max={p.proxy.saved_tokens + (p.ledger.saved_tokens || 1)} label="Token savings" cols={30} suffix="of total" />
+            <Meter value={p.proxy.saved_tokens || 0} max={(p.proxy.saved_tokens || 0) + (p.ledger.saved_tokens || 0)} label="Token savings" cols={30} suffix="of total" />
           </Row>
         </>
       )}

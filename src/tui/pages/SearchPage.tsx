@@ -15,7 +15,11 @@ export function SearchPage() {
       setEditing(true);
       return true;
     }
-    if (k.input === 'c' && results) {
+    // Guarded on `editing` like every other page. A focused TextField is a child,
+    // so it registers its handler before this page's, and the stack is walked
+    // from the top — without the guard this cleared the query on any `c` typed
+    // into the search box.
+    if (k.input === 'c' && results && !editing) {
       setResults(null);
       setQ('');
       return true;

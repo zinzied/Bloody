@@ -134,6 +134,44 @@ test('retry withRetry retries on retryable error', async () => {
   );
   assert.strictEqual(result.ok, true);
   assert.strictEqual(result.value, 'ok');
+  assert.strictEqual(attempts, 3);
+  assert.strictEqual(result.attempts, 3);
+});
+
+test('retry withRetry reports the attempts it actually made', async () => {
+  // A 400 is not retryable, so the loop leaves after one call. The result used to
+  // hard-code maxRetries + 1, billing three requests that never happened.
+  let calls = 0;
+  const refused = await retry.withRetry(
+    async () => {
+      calls++;
+      throw { status: 400 };
+    },
+    { maxRetries: 3, initialDelayMs: 10, jitterRatio: 0 },
+  );
+  assert.strictEqual(refused.ok, false);
+  assert.strictEqual(calls, 1);
+  assert.strictEqual(refused.attempts, 1, 'one call was made');
+
+  // Exhausting the retries still reports every attempt.
+  let all = 0;
+  const exhausted = await retry.withRetry(
+    async () => {
+      all++;
+      throw { status: 500 };
+    },
+    { maxRetries: 2, initialDelayMs: 10, jitterRatio: 0 },
+  );
+  assert.strictEqual(exhausted.ok, false);
+  assert.strictEqual(all, 3);
+  assert.strictEqual(exhausted.attempts, 3);
+
+  // An abort before the first call reports no attempts at all.
+  const controller = new AbortController();
+  controller.abort();
+  const aborted = await retry.withRetry(async () => 'never', { maxRetries: 3 }, controller.signal);
+  assert.strictEqual(aborted.ok, false);
+  assert.strictEqual(aborted.attempts, 0);
 });
 
 test('spill does not spill small text', () => {

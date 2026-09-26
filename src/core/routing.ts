@@ -129,6 +129,15 @@ export function check_fallback_error(status: number, errorText: string, backoffL
     }
   }
 
+  // 4xx outside the table above are the request's fault, not the account's: a
+  // malformed body or a bad path fails identically on every account in the pool.
+  // Falling back AND cooling this account down only evicted a healthy key for
+  // 30s and pushed the request onto a provider that would reject it too. The
+  // listed exceptions are the ones a retry can actually clear.
+  const TRANSIENT_CLIENT_STATUSES = new Set([408, 409, 425, 429]);
+  if (status >= 400 && status < 500 && !TRANSIENT_CLIENT_STATUSES.has(status)) {
+    return { should_fallback: false, cooldown_ms: 0 };
+  }
   return { should_fallback: true, cooldown_ms: TRANSIENT_COOLDOWN_MS };
 }
 
@@ -319,10 +328,15 @@ export class AccountManager {
   }
 
   get_summary(): { id: string; provider: string; status: string; priority: number }[] {
+    // An expired cooldown is not a rate limit. Only a success or an explicit
+    // clear ever removed the marker, so every account that had ever hit a 429
+    // kept reporting `rate_limited` long after the window closed — and
+    // disagreed with get_active_accounts(), which compares against now.
+    const now = Date.now();
     return this._accounts.accounts.map((a) => ({
       id: a.id,
       provider: a.provider,
-      status: a.rate_limited_until ? 'rate_limited' : 'active',
+      status: a.rate_limited_until && Date.parse(a.rate_limited_until) > now ? 'rate_limited' : 'active',
       priority: a.priority || 0,
     }));
   }

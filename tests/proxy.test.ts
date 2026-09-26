@@ -635,3 +635,134 @@ test('a reroute clears the credential minted for the original provider', async (
     } catch {}
   }
 });
+
+test('a named provider with no upstream is reported, not sent to the catalog', () => {
+  // Regression: with the config already pointing at the proxy, a custom local
+  // provider had no recorded upstream. resolveUpstream then fell through to the
+  // models.dev catalog, which matched the model name and shipped the caller's
+  // key to an unrelated third-party gateway that answered "invalid api key".
+  const cfgDir = path.join(TMP, '.config', 'opencode');
+  fs.mkdirSync(cfgDir, { recursive: true });
+  const cfgFile = path.join(cfgDir, 'opencode.jsonc');
+  fs.writeFileSync(cfgFile, JSON.stringify({ model: 'freellmapi/auto' }), 'utf-8');
+  proxy.saveConfig({
+    port: 0,
+    enabled: false,
+    proxied_providers: ['freellmapi'],
+    saved_base_urls: {},
+  });
+
+  const resolved = proxy.resolveUpstream('auto', '/v1/chat/completions', { pathProvider: 'freellmapi' });
+  assert.equal(resolved.url, '', `must not invent an upstream, got ${resolved.url}`);
+  assert.equal(resolved.reason, 'no-upstream-for-named-provider');
+});
+
+test('a named provider with a recorded upstream is used', () => {
+  const cfgDir = path.join(TMP, '.config', 'opencode');
+  fs.mkdirSync(cfgDir, { recursive: true });
+  fs.writeFileSync(path.join(cfgDir, 'opencode.jsonc'), JSON.stringify({ model: 'freellmapi/auto' }), 'utf-8');
+  proxy.saveConfig({
+    port: 0,
+    enabled: false,
+    proxied_providers: ['freellmapi'],
+    saved_base_urls: { freellmapi: 'http://127.0.0.1:31415/v1' },
+  });
+
+  const resolved = proxy.resolveUpstream('auto', '/v1/chat/completions', { pathProvider: 'freellmapi' });
+  assert.equal(resolved.pid, 'freellmapi');
+  assert.equal(resolved.url, 'http://127.0.0.1:31415/v1/chat/completions');
+  assert.equal(resolved.reason, 'path');
+});
+
+test('a 401 is retried only when the proxy held the key, never with the same one twice', async () => {
+  // Two halves of one rule: the client's key is only worth retrying when the
+  // proxy replaced it. When the client already was the credential in play, the
+  // retry is the byte-identical request and can only earn the same 401 again.
+  const seen: string[][] = [];
+  const mock = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      seen.push(rawHeaderLines(req));
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'invalid api key' } }));
+    });
+  });
+  const upstreamPort = await listen(mock);
+  const up = `http://127.0.0.1:${upstreamPort}/v1`;
+  // Unique provider ids: the account store is process-wide and has no removal,
+  // so borrowing 'openai' would pick up a dead account from an earlier test.
+  proxy.saveConfig({
+    port: 0,
+    enabled: false,
+    proxied_providers: ['authretry', 'authpassthrough'],
+    saved_base_urls: { authretry: up, authpassthrough: up },
+    account_strategy: 'round-robin',
+  });
+  proxy.accountManager.add_account('authretry', 'stale-proxy-key', up, 0);
+  const body = JSON.stringify({ model: 'auto', messages: [{ role: 'user', content: 'hi' }] });
+
+  await proxy.start(0);
+  try {
+    // A stale proxy-held key, a fresh client key: one retry, and it carries the
+    // client's credential.
+    const first = await post(proxy.status().port!, '/p/authretry/v1/chat/completions', body, {
+      Authorization: 'Bearer fresh-client-key',
+    });
+    assert.equal(first.status, 401);
+    assert.equal(seen.length, 2, `expected one retry, saw ${seen.length} requests`);
+    assert.ok(
+      /fresh-client-key/i.test(seen[1].join(' ')),
+      `the retry should carry the client's key, got: ${seen[1].join(' | ')}`
+    );
+
+    // No proxy-held key: the client header went out untouched, so there is
+    // nothing to swap and the request must not be repeated.
+    seen.length = 0;
+    const second = await post(proxy.status().port!, '/p/authpassthrough/v1/chat/completions', body, {
+      Authorization: 'Bearer fresh-client-key',
+    });
+    assert.equal(second.status, 401);
+    assert.equal(seen.length, 1, `a pass-through credential must not be retried, saw ${seen.length} requests`);
+  } finally {
+    await proxy.stop();
+    mock.close();
+  }
+});
+
+test('a loopback upstream is recorded before the config is pointed at the proxy', () => {
+  // The regression: a provider whose baseURL is a local server was classed
+  // "already" and skipped, so nothing was written to saved_base_urls — yet the
+  // config was still repointed at the proxy. Every request then had no upstream
+  // to resolve and came back `no_upstream` until a second run recovered it from
+  // the rotated backup.
+  const cfgDir = path.join(TMP, '.config', 'opencode');
+  fs.mkdirSync(cfgDir, { recursive: true });
+  const cfgFile = path.join(cfgDir, 'opencode.jsonc');
+  const router = 'http://127.0.0.1:31555/v1';
+  fs.writeFileSync(
+    cfgFile,
+    `{\n  // notes\n  "model": "loopback/auto",\n  "provider": {\n    "loopback": {\n      "options": {\n        "baseURL": "${router}"\n      }\n    }\n  }\n}\n`,
+    'utf-8'
+  );
+  proxy.saveConfig({ port: 0, enabled: false });
+
+  const result = proxy.ensureProxiedProviders(8199, true);
+  try {
+    assert.ok(result.added.includes('loopback'), `expected the provider to be recorded, got ${JSON.stringify(result)}`);
+    const saved = proxy.loadConfig().saved_base_urls || {};
+    assert.equal(saved.loopback, router, 'the real upstream must be on record before the config is rewritten');
+    const raw = fs.readFileSync(cfgFile, 'utf-8');
+    const rewritten = JSON.parse(raw.replace(/^\s*\/\/.*$/gm, ''));
+    assert.equal(rewritten.provider.loopback.options.baseURL, 'http://127.0.0.1:8199/p/loopback/v1');
+    assert.match(raw, /\/\/ notes/);
+    // And the recorded upstream is what the request resolves to.
+    const resolved = proxy.resolveUpstream('auto', '/v1/chat/completions', { pathProvider: 'loopback' });
+    assert.equal(resolved.url, `${router}/chat/completions`);
+  } finally {
+    proxy.restoreDirectUrls();
+    try {
+      fs.unlinkSync(cfgFile);
+    } catch {}
+  }
+});
+

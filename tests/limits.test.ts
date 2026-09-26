@@ -11,6 +11,7 @@ process.env.TOKENSAVER_HOME = TMP;
 const budget = await import('../src/core/budget.js');
 const proxy = await import('../src/core/proxy.js');
 const { eventBus, EVENT_TOPICS } = await import('../src/core/control-api.js');
+const insights = await import('../src/core/insights.js');
 
 const FREE_LIMIT = 100000;
 
@@ -75,7 +76,8 @@ test('choosing "reset" clears the counters and keeps the configured model', () =
 
   const decision = budget.setLimitDecision('reset');
   assert.strictEqual(decision.choice, 'reset');
-  assert.strictEqual(decision.date, budget.loadLimitDecision()!.date);
+  // Deliberately not persisted: "reset" is an action, not a standing answer.
+  assert.strictEqual(budget.loadLimitDecision(), null, 'a reset must not stay on record for the rest of the day');
 
   const status = budget.getBudgetStatus();
   assert.strictEqual(status.limitReached, false, 'counters are cleared so nothing is "reached" anymore');
@@ -84,8 +86,18 @@ test('choosing "reset" clears the counters and keeps the configured model', () =
   assert.strictEqual(status.daily.requests, 0);
   assert.strictEqual(status.choiceRequired, false);
   assert.strictEqual(status.blockingActive, false);
-  assert.strictEqual(status.decision!.choice, 'reset');
+  assert.strictEqual(status.decision, null);
   assert.strictEqual(budget.shouldEnforceBudget().enforce, false);
+
+  // The regression: with the answer left on file for the day, reaching the limit
+  // again asked nothing (choiceRequired needs `!decision`) and the guard could
+  // never be armed (blockingActive needs `choice === 'blocked'`).
+  budget.recordDailySpend({ tokens: FREE_LIMIT + 5, cost: 0.5, tokensOut: 10 });
+  const again = budget.getBudgetStatus();
+  assert.strictEqual(again.limitReached, true);
+  assert.strictEqual(again.choiceRequired, true, 'the user is asked again after spending past the limit');
+  budget.setLimitDecision('blocked');
+  assert.strictEqual(budget.getBudgetStatus().blockingActive, true, 'and can still choose to be blocked');
 });
 
 test('choosing "stay blocked" is the only way to activate the guard', () => {
@@ -162,7 +174,7 @@ test('proxy helpers answer the prompt like the CLI/UI do', () => {
 
   proxy.resetDailyLimit();
   const status = budget.getBudgetStatus();
-  assert.strictEqual(status.decision!.choice, 'reset');
+  assert.strictEqual(status.decision, null, 'a reset leaves no standing answer behind');
   assert.strictEqual(status.spentTokens, 0, 'reset clears counters');
   assert.strictEqual(budget.shouldEnforceBudget().enforce, false, 'after a reset nothing is blocked');
 });
@@ -202,6 +214,74 @@ test('a reached limit without an answer still forwards to the configured model',
     assert.strictEqual(status.limitReached, true, 'the limit is still tracked');
     assert.strictEqual(status.choiceRequired, true, 'the user is asked to choose');
     assert.strictEqual(status.blockingActive, false, 'nothing is blocked');
+  } finally {
+    await proxy.stop();
+    mock.close();
+  }
+});
+
+test('a proxied request bills both sides of the exchange to the daily budget', async () => {
+  // The regression: recordHistory() passed 0 for the output side to both
+  // estimateCostForRequest() and recordDailySpend(), so `tokensOut` stayed 0 for
+  // the life of the install and the reported spend ignored every reply — the
+  // expensive half on any paid model.
+  const reply = 'The answer is quite long indeed, and it repeats itself a little. '.repeat(40);
+  const mock = http.createServer((req, res) => {
+    let chunks = '';
+    req.on('data', (c) => (chunks += c));
+    req.on('end', () => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          id: 'x',
+          object: 'chat.completion',
+          choices: [{ index: 0, message: { role: 'assistant', content: reply }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+        })
+      );
+    });
+  });
+  const mockPort = await listen(mock);
+  proxy.saveConfig({
+    port: 0,
+    enabled: false,
+    proxied_providers: ['openai'],
+    saved_base_urls: { openai: `http://127.0.0.1:${mockPort}/v1` },
+  });
+
+  resetAll();
+  await proxy.start(0);
+  try {
+    const prompt = 'Please explain how a proxy server forwards an HTTP request. '.repeat(20);
+    const s = await post(
+      proxy.status().port!,
+      '/v1/chat/completions',
+      JSON.stringify({ model: 'openai/gpt-4o', messages: [{ role: 'user', content: prompt }] })
+    );
+    assert.strictEqual(s.status, 200);
+
+    const status = budget.getBudgetStatus();
+    assert.strictEqual(status.daily.requests, 1);
+    assert.ok(status.daily.tokensIn > 0, 'the request side is counted');
+    assert.ok(status.daily.tokensOut > 0, 'the reply side used to be counted as zero');
+    assert.strictEqual(
+      status.spentTokens,
+      status.daily.tokensIn + status.daily.tokensOut,
+      'the free-token limit sees both sides'
+    );
+    // Output is the dearer side, so the cost must exceed what the request alone
+    // would have been charged for.
+    assert.ok(
+      status.spentUSD > status.daily.tokensIn / 1_000_000,
+      `spend ${status.spentUSD} should exceed the input-only fallback ${status.daily.tokensIn / 1_000_000}`
+    );
+
+    // And the per-provider quota totals are no longer stuck at zero.
+    const summary = insights.quotaSummary();
+    const row = summary.quota.providers.openai;
+    assert.ok(row, 'the provider is filed under its real id');
+    assert.ok((row as any).total_tokens_in > 0, 'input tokens reach the quota tracker');
+    assert.ok((row as any).total_tokens_out > 0, 'output tokens reach the quota tracker');
   } finally {
     await proxy.stop();
     mock.close();

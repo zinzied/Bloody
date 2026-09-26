@@ -9,6 +9,23 @@ export const TS_VERSION = '10.0.0';
 const BASE_HOME = process.env.TOKENSAVER_HOME || os.homedir();
 
 export const CONFIG_PATH = path.join(BASE_HOME, '.config', 'opencode', 'opencode.jsonc');
+/**
+ * Every config file OpenCode loads, in its own precedence order.
+ *
+ * OpenCode merges `config.json`, `opencode.json` and `opencode.jsonc` at
+ * startup, so a provider can be defined in more than one of them. Rewriting
+ * only `opencode.jsonc` leaves the other copy still pointing at the real
+ * upstream, and whichever file wins the merge decides whether the proxy is
+ * used at all — and a request that skipped the proxy's per-provider path
+ * arrives with no hint about which provider it belongs to.
+ */
+export function config_paths(): string[] {
+  return [
+    path.join(BASE_HOME, '.config', 'opencode', 'config.json'),
+    path.join(BASE_HOME, '.config', 'opencode', 'opencode.json'),
+    path.join(BASE_HOME, '.config', 'opencode', 'opencode.jsonc'),
+  ];
+}
 export const BACKUP_DIR = path.join(BASE_HOME, '.config', 'opencode');
 export const CACHE_PATH = path.join(BASE_HOME, '.config', 'opencode', 'models_cache.json');
 export const SNAPSHOT_PATH = path.join(BASE_HOME, '.config', 'opencode', 'models_snapshot.json');
@@ -196,6 +213,427 @@ export function read_config(): Record<string, any> | null {
   }
 }
 
+function read_config_file(filePath: string): Record<string, any> | null {
+  const raw = read_raw_config_file(filePath);
+  if (raw === null) return null;
+  try {
+    return JSON.parse(strip_jsonc(raw)) as Record<string, any>;
+  } catch {
+    return null;
+  }
+}
+
+/** A config file's text with any byte-order mark removed, or null if unreadable. */
+function read_raw_config_file(filePath: string): string | null {
+  if (!fs.existsSync(filePath)) return null;
+  try {
+    const raw = fs.readFileSync(filePath, 'utf-8');
+    return raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+  } catch {
+    return null;
+  }
+}
+
+/** Provider ids differ only by case and `-`/`_` spelling in the wild. */
+export function provider_id_key(pid: string): string {
+  return String(pid || '').trim().toLowerCase().replace(/-/g, '_');
+}
+
+/** The key a provider id is stored under in `providers`, or '' when absent. */
+export function provider_key_in(providers: Record<string, any> | null | undefined, pid: string): string {
+  if (!providers || typeof providers !== 'object' || !pid) return '';
+  if (providers[pid] !== undefined) return pid;
+  const target = provider_id_key(pid);
+  if (!target) return '';
+  for (const k of Object.keys(providers)) if (provider_id_key(k) === target) return k;
+  return '';
+}
+
+/** A provider's entry in a `provider` map, matched case- and separator-insensitively. */
+export function provider_entry(providers: Record<string, any> | null | undefined, pid: string): any {
+  const key = provider_key_in(providers, pid);
+  return key ? providers![key] : undefined;
+}
+
+const MAX_JSONC_DEPTH = 64;
+
+/** One property found in a JSONC document, with the offsets needed to edit it. */
+interface JsoncProperty {
+  path: string[];
+  valueStart: number;
+  valueEnd: number;
+  /** Offset of `{` for an object value, -1 otherwise. */
+  objectStart: number;
+  /** Offset of `}` for an object value, -1 otherwise. */
+  objectEnd: number;
+  childCount: number;
+  /** Indentation of the line the object's first property starts on. */
+  firstKeyIndent: string;
+}
+
+/**
+ * Locate every property in a JSONC document without losing the original text.
+ *
+ * Comments and formatting are the user's, and they are not recoverable once a
+ * document has been parsed and re-serialized — which is why editing a config
+ * needs offsets into the original rather than a parse/stringify round trip.
+ * Returns null when the text is not a JSONC object, so a caller can refuse to
+ * touch a file it does not fully understand.
+ */
+function jsonc_properties(raw: string): { root: JsoncProperty; props: JsoncProperty[] } | null {
+  const props: JsoncProperty[] = [];
+  let broken = false;
+
+  const isSpace = (c: string): boolean => c === ' ' || c === '\t' || c === '\n' || c === '\r';
+
+  const skipTrivia = (from: number): number => {
+    let p = from;
+    for (;;) {
+      while (p < raw.length && isSpace(raw[p])) p++;
+      if (raw[p] === '/' && raw[p + 1] === '/') {
+        while (p < raw.length && raw[p] !== '\n') p++;
+        continue;
+      }
+      if (raw[p] === '/' && raw[p + 1] === '*') {
+        const end = raw.indexOf('*/', p + 2);
+        if (end < 0) {
+          broken = true;
+          return p;
+        }
+        p = end + 2;
+        continue;
+      }
+      return p;
+    }
+  };
+
+  const lineIndentAt = (offset: number): string => {
+    let start = offset;
+    while (start > 0 && raw[start - 1] !== '\n') start--;
+    let end = start;
+    while (end < raw.length && (raw[end] === ' ' || raw[end] === '\t')) end++;
+    return raw.slice(start, end);
+  };
+
+  const readString = (from: number): { value: string; end: number } | null => {
+    if (raw[from] !== '"') return null;
+    let p = from + 1;
+    while (p < raw.length) {
+      const c = raw[p];
+      if (c === '\\') {
+        p += 2;
+        continue;
+      }
+      if (c === '"') {
+        try {
+          return { value: JSON.parse(raw.slice(from, p + 1)) as string, end: p + 1 };
+        } catch {
+          broken = true;
+          return null;
+        }
+      }
+      p++;
+    }
+    broken = true;
+    return null;
+  };
+
+  interface Scan {
+    end: number;
+    objectStart: number;
+    objectEnd: number;
+    childCount: number;
+    firstKeyIndent: string;
+  }
+
+  const scanValue = (from: number, path: string[], depth: number): Scan | null => {
+    if (depth > MAX_JSONC_DEPTH) {
+      broken = true;
+      return null;
+    }
+    const c = raw[from];
+    if (c === '{') {
+      const obj = scanObject(from, path, depth);
+      if (!obj) return null;
+      return { end: obj.end, objectStart: from, objectEnd: obj.end - 1, ...obj.shape };
+    }
+    if (c === '[') {
+      const arr = scanArray(from, path, depth);
+      return arr ? { end: arr, objectStart: -1, objectEnd: -1, childCount: 0, firstKeyIndent: '' } : null;
+    }
+    if (c === '"') {
+      const s = readString(from);
+      return s ? { end: s.end, objectStart: -1, objectEnd: -1, childCount: 0, firstKeyIndent: '' } : null;
+    }
+    let p = from;
+    while (p < raw.length && raw[p] !== ',' && raw[p] !== '}' && raw[p] !== ']' && !isSpace(raw[p])) p++;
+    if (p === from) {
+      broken = true;
+      return null;
+    }
+    return { end: p, objectStart: -1, objectEnd: -1, childCount: 0, firstKeyIndent: '' };
+  };
+
+  const scanArray = (from: number, path: string[], depth: number): number | null => {
+    let p = skipTrivia(from + 1);
+    if (raw[p] === ']') return p + 1;
+    for (;;) {
+      const v = scanValue(p, path, depth + 1);
+      if (!v) return null;
+      p = skipTrivia(v.end);
+      if (raw[p] === ',') {
+        p = skipTrivia(p + 1);
+        continue;
+      }
+      if (raw[p] === ']') return p + 1;
+      broken = true;
+      return null;
+    }
+  };
+
+  function scanObject(
+    from: number,
+    path: string[],
+    depth: number
+  ): { end: number; shape: { childCount: number; firstKeyIndent: string } } | null {
+    let p = skipTrivia(from + 1);
+    let childCount = 0;
+    let firstKeyIndent = '';
+    for (;;) {
+      if (p >= raw.length) {
+        broken = true;
+        return null;
+      }
+      if (raw[p] === '}') return { end: p + 1, shape: { childCount, firstKeyIndent } };
+      if (raw[p] === ',') {
+        p = skipTrivia(p + 1);
+        continue;
+      }
+      const key = readString(p);
+      if (!key) return null;
+      if (childCount === 0) firstKeyIndent = lineIndentAt(p);
+      childCount++;
+      p = skipTrivia(key.end);
+      if (raw[p] !== ':') {
+        broken = true;
+        return null;
+      }
+      p = skipTrivia(p + 1);
+      const v = scanValue(p, [...path, key.value], depth + 1);
+      if (!v) return null;
+      props.push({
+        path: [...path, key.value],
+        valueStart: p,
+        valueEnd: v.end,
+        objectStart: v.objectStart,
+        objectEnd: v.objectEnd,
+        childCount: v.childCount,
+        firstKeyIndent: v.firstKeyIndent,
+      });
+      p = skipTrivia(v.end);
+    }
+  }
+
+  const start = skipTrivia(0);
+  if (raw[start] !== '{') return null;
+  const root = scanObject(start, [], 0);
+  if (!root || broken) return null;
+  return {
+    root: {
+      path: [],
+      valueStart: start,
+      valueEnd: root.end,
+      objectStart: start,
+      objectEnd: root.end - 1,
+      childCount: root.shape.childCount,
+      firstKeyIndent: root.shape.firstKeyIndent,
+    },
+    props,
+  };
+}
+
+/** Whether `text` is a JSONC document this module can edit without guessing. */
+function is_editable_jsonc(text: string): boolean {
+  return jsonc_properties(text) !== null;
+}
+
+/**
+ * Set one property in a JSONC document, leaving every other byte alone.
+ *
+ * Replaces the value in place when the property exists, and otherwise inserts it
+ * into the closest enclosing object that does — so a commented config keeps its
+ * comments, its key order and its formatting. Returns null when the path cannot
+ * be placed, and the caller must then leave the file alone: guessing would mean
+ * rewriting it from the parsed object, which is what loses the comments.
+ */
+export function set_jsonc_value(raw: string, keyPath: string[], value: unknown): string | null {
+  if (!keyPath.length) return null;
+  const doc = jsonc_properties(raw);
+  if (!doc) return null;
+
+  const existing = doc.props.find(
+    (p) => p.path.length === keyPath.length && p.path.every((seg, i) => seg === keyPath[i])
+  );
+  if (existing) {
+    return raw.slice(0, existing.valueStart) + JSON.stringify(value) + raw.slice(existing.valueEnd);
+  }
+
+  let host: JsoncProperty = doc.root;
+  let prefixLen = 0;
+  for (let i = 0; i < keyPath.length - 1; i++) {
+    const child = doc.props.find((p) => p.path.length === i + 1 && p.path[i] === keyPath[i] && p.objectStart >= 0);
+    if (!child) break;
+    host = child;
+    prefixLen = i + 1;
+  }
+  if (host.objectStart < 0) return null;
+
+  // The host object supplies the outermost braces, so the text to insert is the
+  // next key with the rest of the path nested inside it.
+  let inner: unknown = value;
+  for (let i = keyPath.length - 1; i > prefixLen; i--) inner = { [keyPath[i]]: inner };
+  const literal = `${JSON.stringify(keyPath[prefixLen])}: ${JSON.stringify(inner)}`;
+
+  if (host.childCount === 0) {
+    // An empty object written across lines keeps its lines; `{}` on one line
+    // gets the property inline.
+    const inside = raw.slice(host.objectStart + 1, host.objectEnd);
+    if (!inside.includes('\n') || inside.trim() !== '') {
+      return raw.slice(0, host.objectEnd) + literal + raw.slice(host.objectEnd);
+    }
+    const closingIndent = inside.slice(inside.lastIndexOf('\n') + 1);
+    return (
+      raw.slice(0, host.objectStart + 1) +
+      `\n${closingIndent}  ${literal}\n${closingIndent}` +
+      raw.slice(host.objectEnd)
+    );
+  }
+
+  // Put the separator ahead of the whitespace before the closing brace, so it
+  // lands after the last property rather than on a line of its own.
+  let at = host.objectEnd;
+  while (at > host.objectStart + 1 && (raw[at - 1] === ' ' || raw[at - 1] === '\t' || raw[at - 1] === '\n' || raw[at - 1] === '\r')) {
+    at--;
+  }
+  const lead = raw.slice(at, host.objectEnd).includes('\n') ? `,\n${host.firstKeyIndent}` : ', ';
+  return raw.slice(0, at) + lead + literal + raw.slice(at);
+}
+
+/**
+ * OpenCode's view of its config: every file it loads, merged, later files
+ * winning. Provider entries are merged per provider rather than per file so a
+ * provider defined in `opencode.json` is still visible when `opencode.jsonc`
+ * only overrides one of its fields.
+ *
+ * Cached on each file's mtime: credential lookup runs per alias per provider on
+ * every proxied request, and re-reading and re-parsing all three files each time
+ * turned one chat completion into hundreds of synchronous reads. The result is
+ * shared between callers, so treat it as read-only.
+ */
+let _mergedCache: Record<string, any> | null = null;
+let _mergedCacheKey = '';
+
+export function read_merged_config(): Record<string, any> {
+  const files = config_paths();
+  let key = '';
+  for (const file of files) {
+    try {
+      const st = fs.statSync(file);
+      key += `${file}:${st.mtimeMs}:${st.size};`;
+    } catch {
+      key += `${file}:-;`;
+    }
+  }
+  if (_mergedCache && key === _mergedCacheKey) return _mergedCache;
+  const out: Record<string, any> = {};
+  for (const file of files) {
+    const cfg = read_config_file(file);
+    if (!cfg) continue;
+    for (const [k, v] of Object.entries(cfg)) {
+      if (k !== 'provider') {
+        out[k] = v;
+        continue;
+      }
+      const src = (v || {}) as Record<string, any>;
+      const dst = (out.provider && typeof out.provider === 'object' ? out.provider : {}) as Record<string, any>;
+      for (const [pid, p] of Object.entries(src)) {
+        if (dst[pid] && typeof dst[pid] === 'object' && typeof p === 'object' && p !== null) {
+          dst[pid] = { ...dst[pid], ...(p as Record<string, any>) };
+        } else {
+          dst[pid] = p;
+        }
+      }
+      out.provider = dst;
+    }
+  }
+  _mergedCache = out;
+  _mergedCacheKey = key;
+  return out;
+}
+
+/** The `{env:VAR}`-backed credential a provider declares in the user's config. */
+export function config_env_credential(pid: string): string {
+  const providers = read_merged_config()?.provider;
+  if (!providers || typeof providers !== 'object') return '';
+  for (const alias of [pid, pid.replace(/-/g, '_'), pid.replace(/_/g, '-')]) {
+    const p = provider_entry(providers, alias);
+    if (!p || typeof p !== 'object') continue;
+    const raw = String((p as Record<string, any>).options?.apiKey ?? '');
+    const m = /^\{env:([^}]+)\}$/.exec(raw.trim());
+    const v = m ? process.env[m[1].trim()] : raw;
+    if (v && v.trim() && !/^\{.*\}$/.test(v.trim())) return v.trim();
+  }
+  return '';
+}
+
+/** Rotated backups for one config file name, newest first. */
+function backup_candidates(name: string): string[] {
+  if (!fs.existsSync(BACKUP_DIR)) return [];
+  const prefix = name.replace(/(\.jsonc?)$/, '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`^${prefix}\\.jsonc?\\..*\\.backup$`);
+  try {
+    return fs.readdirSync(BACKUP_DIR).filter((n) => re.test(n)).sort().reverse();
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The provider's real upstream, recovered when the live config already points at
+ * the proxy and no URL was recorded.
+ *
+ * A local provider's genuine upstream is itself a loopback address, so "looks
+ * local" cannot distinguish it from the proxy — only the proxy's own port can.
+ * Without a recovery path an interrupted run leaves the provider permanently
+ * unroutable, and requests then fall through to a catalog guess that forwards
+ * the caller's key to an unrelated third party.
+ */
+export function find_original_provider_base_url(pid: string, selfPort?: number): string {
+  const isProxy = (u: string) => {
+    const s = String(u || '').trim();
+    if (!s) return false;
+    if (selfPort && new RegExp(`127\\.0\\.0\\.1:${selfPort}(/|$)|localhost:${selfPort}(/|$)`).test(s)) return true;
+    return false;
+  };
+  const take = (cfg: Record<string, any> | null): string => {
+    const p = cfg?.provider ? (cfg.provider as Record<string, any>)[pid] : undefined;
+    if (!p || typeof p !== 'object') return '';
+    const u = String((p as Record<string, any>).options?.baseURL || '').replace(/\/+$/, '');
+    return u && !isProxy(u) ? u : '';
+  };
+  for (const file of config_paths()) {
+    const found = take(read_config_file(file));
+    if (found) return found;
+  }
+  for (const file of config_paths()) {
+    for (const b of backup_candidates(path.basename(file))) {
+      const found = take(read_config_file(path.join(BACKUP_DIR, b)));
+      if (found) return found;
+    }
+  }
+  return '';
+}
+
 function _sync_model_state(modelId: string, smallId: string): void {
   const statePath = path.join(BASE_HOME, '.local', 'state', 'opencode', 'model.json');
   if (!fs.existsSync(statePath)) return;
@@ -214,16 +652,19 @@ function _sync_model_state(modelId: string, smallId: string): void {
   } catch {}
 }
 
-export function rotate_backup(): void {
-  if (!fs.existsSync(CONFIG_PATH)) return;
+export function rotate_backup(target: string = CONFIG_PATH): void {
+  if (!fs.existsSync(target)) return;
   const now = new Date();
   const pad = (n: number) => String(n).padStart(2, '0');
   const ts = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-  const backup = path.join(BACKUP_DIR, `opencode.jsonc.${ts}.backup`);
-  fs.copyFileSync(CONFIG_PATH, backup);
+  const name = path.basename(target);
+  const prefix = name.replace(/(\.jsonc?)$/, '');
+  const backup = path.join(BACKUP_DIR, `${name}.${ts}.backup`);
+  fs.copyFileSync(target, backup);
+  const re = new RegExp(`^${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.jsonc?\\..*\\.backup$`);
   const old = fs
     .readdirSync(BACKUP_DIR)
-    .filter((n) => /^opencode\.jsonc\..*\.backup$/.test(n))
+    .filter((n) => re.test(n))
     .sort()
     .reverse();
   for (const f of old.slice(MAX_BACKUPS)) {
@@ -235,23 +676,36 @@ export function rotate_backup(): void {
 
 export function write_config(modelId: string, smallId: string): void {
   const existing = read_config() || {};
-  const con: Record<string, any> = {
-    model: modelId,
-    small_model: smallId,
-    compaction: { auto: true, prune: true, reserved: 10000 },
-  };
-  con.provider = existing.provider || {};
-  for (const pid of Object.keys(con.provider)) {
-    if (typeof con.provider[pid] === 'object' && con.provider[pid] !== null) {
-      const opts = con.provider[pid].options || {};
-      if (opts.timeout === undefined) opts.timeout = 300000;
-      if (opts.chunkTimeout === undefined) opts.chunkTimeout = 60000;
-      con.provider[pid].options = opts;
+  const providers = (existing.provider && typeof existing.provider === 'object' ? existing.provider : {}) as Record<string, any>;
+  // A missing file needs a whole document; an existing one is edited in place.
+  // Rewriting it from the parsed object would drop every key this function does
+  // not set — theme, agent, permission, mcp, the user's comments — and this runs
+  // on every model switch, from the CLI, the models page and insights alike.
+  let next = read_raw_config_file(CONFIG_PATH) ?? '{\n}\n';
+  const edits: Array<[string[], unknown]> = [
+    [['model'], modelId],
+    [['small_model'], smallId],
+    [['compaction'], { auto: true, prune: true, reserved: 10000 }],
+  ];
+  for (const pid of Object.keys(providers)) {
+    const p = providers[pid];
+    if (typeof p !== 'object' || p === null) continue;
+    const opts = p.options || {};
+    if (opts.timeout === undefined) edits.push([['provider', pid, 'options', 'timeout'], 300000]);
+    if (opts.chunkTimeout === undefined) edits.push([['provider', pid, 'options', 'chunkTimeout'], 60000]);
+  }
+  for (const [keyPath, value] of edits) {
+    const spliced = set_jsonc_value(next, keyPath, value);
+    if (spliced === null) {
+      console.warn(`[config] cannot place ${keyPath.join('.')} in ${CONFIG_PATH} — left untouched`);
+      continue;
     }
+    next = spliced;
   }
   fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
   if (fs.existsSync(CONFIG_PATH)) rotate_backup();
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(con, null, 2) + '\n', 'utf-8');
+  fs.writeFileSync(CONFIG_PATH, next.endsWith('\n') ? next : `${next}\n`, 'utf-8');
+  _mergedCache = null;
   _sync_model_state(modelId, smallId);
 }
 
@@ -316,7 +770,7 @@ export function get_working_providers(): string[] {
 
 export function get_config_provider_base_url(pid: string): string {
   const cfg = read_config();
-  const p = cfg && cfg.provider ? cfg.provider[pid] : undefined;
+  const p = provider_entry(cfg && cfg.provider ? cfg.provider : null, pid);
   if (typeof p === 'object' && p !== null) {
     const opts = (p as Record<string, any>).options || {};
     return String(opts.baseURL || '').replace(/\/+$/, '');
@@ -324,52 +778,87 @@ export function get_config_provider_base_url(pid: string): string {
   return '';
 }
 
-export function set_provider_base_urls(proxyUrl: string, providers: string[]): string[] {
-  const cfg = read_config();
-  if (!cfg) return [];
+/**
+ * Rewrite one `options.baseURL` per provider, in place, across every config file
+ * that defines the provider.
+ *
+ * `edit` returns the new text, or null when the value must not change. The text
+ * is spliced rather than re-serialized so a commented `opencode.jsonc` keeps its
+ * comments, key order and formatting — a `JSON.stringify` rewrite destroys all
+ * three, and these files belong to the user, not to this tool.
+ */
+function edit_provider_base_urls(
+  providers: string[],
+  edit: (pid: string, key: string, current: string) => string | null
+): string[] {
   const changed: string[] = [];
-  for (const pid of providers) {
-    if (!cfg.provider || typeof cfg.provider[pid] !== 'object' || cfg.provider[pid] === null) continue;
-    const cur = get_config_provider_base_url(pid);
-    if (cur && /127\.0\.0\.1:\d+|localhost:\d+/.test(cur)) continue;
-    const opts = cfg.provider[pid].options || {};
-    opts.baseURL = proxyUrl;
-    cfg.provider[pid].options = opts;
-    changed.push(pid);
+  let wrote = false;
+  for (const file of config_paths()) {
+    const raw = read_raw_config_file(file);
+    if (raw === null) continue;
+    const cfg = read_config_file(file);
+    if (!cfg || !cfg.provider) continue;
+
+    let next = raw;
+    const touched: string[] = [];
+    for (const pid of providers) {
+      const key = provider_key_in(cfg.provider, pid);
+      const entry = key ? cfg.provider[key] : undefined;
+      if (!key || !entry || typeof entry !== 'object') continue;
+      const current = String((entry.options || {}).baseURL || '').replace(/\/+$/, '');
+      const replacement = edit(pid, key, current);
+      if (replacement === null) continue;
+      const spliced = set_jsonc_value(next, ['provider', key, 'options', 'baseURL'], replacement);
+      if (spliced === null) {
+        console.warn(`[config] cannot place options.baseURL for '${pid}' in ${file} — left untouched`);
+        continue;
+      }
+      next = spliced;
+      touched.push(pid);
+    }
+    if (!touched.length || !is_editable_jsonc(next)) continue;
+    try {
+      rotate_backup(file);
+      fs.writeFileSync(file, next, 'utf-8');
+      wrote = true;
+      for (const pid of touched) if (!changed.includes(pid)) changed.push(pid);
+    } catch {
+      continue;
+    }
   }
-  if (!changed.length) return changed;
-  try {
-    if (fs.existsSync(CONFIG_PATH)) rotate_backup();
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + '\n', 'utf-8');
-  } catch {
-    return [];
-  }
-  return changed;
+  if (wrote) _mergedCache = null;
+  return wrote ? changed : [];
+}
+
+/**
+ * Point each provider's baseURL at the local proxy.
+ *
+ * Each provider gets its own path (`/p/<provider>/v1`) instead of a shared
+ * `/v1`, so a request that arrives through the proxy still says which provider
+ * it came from. A shared path loses that: a model id without a provider prefix
+ * (`big-pickle`) would be guessed, and a guess sends the request — and the
+ * client's key — to the wrong upstream, which answers 401/403.
+ */
+export function set_provider_base_urls(proxyUrl: string, providers: string[]): string[] {
+  const root = String(proxyUrl).replace(/\/+$/, '').replace(/\/v1$/, '');
+  return edit_provider_base_urls(providers, (_pid, key, current) => {
+    // A local upstream (a router on loopback, ollama) is rewritten on purpose:
+    // the proxy records it in saved_base_urls first, so it still resolves, and
+    // the request gets compressed instead of bypassing the proxy entirely.
+    const target = `${root}/p/${key}/v1`;
+    return current === target ? null : target;
+  });
 }
 
 export function restore_provider_base_urls(saved: Record<string, string>): string[] {
-  const cfg = read_config();
-  if (!cfg || !cfg.provider) return [];
-  const changed: string[] = [];
   const selfHost = /127\.0\.0\.1:\d+|localhost:\d+/;
-  for (const [pid, realUrl] of Object.entries(saved)) {
-    if (!realUrl || typeof cfg.provider[pid] !== 'object' || cfg.provider[pid] === null) continue;
-    const opts = cfg.provider[pid].options || {};
-    const cur = String(opts.baseURL || '').replace(/\/+$/, '');
+  return edit_provider_base_urls(Object.keys(saved), (pid, key, current) => {
+    const realUrl = saved[pid] || saved[key];
+    if (!realUrl) return null;
     // only restore entries that currently point at a local proxy address
-    if (!cur || !selfHost.test(cur)) continue;
-    opts.baseURL = String(realUrl).replace(/\/+$/, '');
-    cfg.provider[pid].options = opts;
-    changed.push(pid);
-  }
-  if (!changed.length) return changed;
-  try {
-    if (fs.existsSync(CONFIG_PATH)) rotate_backup();
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + '\n', 'utf-8');
-  } catch {
-    return [];
-  }
-  return changed;
+    if (!current || !selfHost.test(current)) return null;
+    return String(realUrl).replace(/\/+$/, '');
+  });
 }
 
 export function get_providers_from_catalog_crossref(): string[] {

@@ -8,6 +8,7 @@ export function ProxyPage() {
   const [status, setStatus] = useState<ProxyStatus | null>(null);
   const [error, setError] = useState('');
   const [port, setPort] = useState(String(proxy.DEFAULT_PORT));
+  const [portEdited, setPortEdited] = useState(false);
   const [editPort, setEditPort] = useState(false);
   const [test, setTest] = useState<any>(null);
 
@@ -27,8 +28,18 @@ export function ProxyPage() {
   }, [refresh]);
 
   useEffect(() => {
+    // The poll hands back a fresh object every 2s, so this used to re-seed the
+    // field mid-edit and silently revert whatever the user had typed. Only track
+    // the live port until they touch it.
+    if (portEdited) return;
     if (status && status.port) setPort(String(status.port));
-  }, [status]);
+  }, [status, portEdited]);
+
+  // An empty or half-typed field must not reach start(): 0 is falsy but is still
+  // a "use this port" signal, and `listen(0)` would bind a random port while
+  // every provider baseURL got rewritten to http://127.0.0.1:0.
+  const portNum = Number(port);
+  const portArg = Number.isInteger(portNum) && portNum > 0 && portNum <= 65535 ? portNum : proxy.DEFAULT_PORT;
 
   const doAction = useCallback(
     (fn: () => Promise<unknown>) => {
@@ -54,7 +65,7 @@ export function ProxyPage() {
     if (editPort) return false;
     if (k.enter) {
       if (running) doAction(() => proxy.stop());
-      else doAction(() => proxy.start(Number(port)));
+      else doAction(() => proxy.start(portArg));
       return true;
     }
     switch (k.input) {
@@ -62,14 +73,14 @@ export function ProxyPage() {
         setEditPort(true);
         return true;
       case 's':
-        doAction(() => proxy.start(Number(port)));
+        doAction(() => proxy.start(portArg));
         return true;
       case 't':
         doAction(() => proxy.stop());
         return true;
       case 'e':
         doAction(async () => {
-          proxy.enable(true, Number(port));
+          proxy.enable(true, portArg);
         });
         return true;
       case 'd':
@@ -82,9 +93,7 @@ export function ProxyPage() {
         return true;
       case 'y':
         doAction(async () => {
-          const levels = ['caveman-lite', 'caveman-full', 'ponytail-lite', 'off'];
-          const cur = proxy.outputStyle().label;
-          const next = levels[(levels.indexOf(cur) + 1) % levels.length];
+          const next = proxy.nextOutputStyle();
           proxy.setOutputStyle(next);
           proxy.saveConfig({ ...proxy.loadConfig(), output_style: next });
           return next;
@@ -152,7 +161,10 @@ export function ProxyPage() {
             <TextField
               label="Port"
               value={port}
-              onChange={setPort}
+              onChange={(v) => {
+                setPortEdited(true);
+                setPort(v);
+              }}
               onSubmit={() => setEditPort(false)}
               onCancel={() => setEditPort(false)}
               placeholder="8199"

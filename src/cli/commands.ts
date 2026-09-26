@@ -384,7 +384,12 @@ async function cmdProxy(args: string[]): Promise<number> {
       if (r.already.length) out(`Already proxied: ${r.already.join(', ')}`);
       if (r.skipped.length) out(`Skipped (no known upstream): ${r.skipped.join(', ')}`);
       if (r.rewritten.length) out(`Routed through proxy (opencode.jsonc): ${r.rewritten.join(', ')}`);
-      if (!r.added.length && !r.rewritten.length) out('All detected providers are already proxied.');
+      // `skipped` counts as work done: without it a run that found no upstream
+      // for a provider printed "All detected providers are already proxied."
+      // directly under the list of providers it had just skipped.
+      if (!r.added.length && !r.rewritten.length && !r.skipped.length) {
+        out('All detected providers are already proxied.');
+      }
       if (r.rewritten.length) out('Restart opencode if it is running for the new routing to take effect.');
       return 0;
     }
@@ -419,11 +424,20 @@ async function cmdProxy(args: string[]): Promise<number> {
           proxy.saveConfig(cfg);
           out('Output style escalation on.');
         } else if (/^[\d\s,.]+$/.test(arg)) {
-          const next = proxy.setOutputStyleEscalation(undefined, arg.split(','));
+          // Passing thresholds is a request to retune the ladder, so escalation
+          // is switched on with them. It used to pass `undefined` for `enabled`,
+          // which re-derived the flag from the saved config — so after an earlier
+          // `escalate off` the thresholds were stored but stayed inert, while the
+          // line below still announced "on".
+          const next = proxy.setOutputStyleEscalation(true, arg.split(','));
           cfg.output_style_escalate = next.enabled;
           cfg.output_style_escalate_at = next.at;
           proxy.saveConfig(cfg);
-          out(`Escalation  : on — level steps up at ${next.at.join(', ')} tokens`);
+          out(
+            next.enabled
+              ? `Escalation  : on — level steps up at ${next.at.join(', ')} tokens`
+              : `Escalation  : off — ${next.at.join(', ')} tokens stored but TOKENSAVER_OUTPUT_STYLE_ESCALATE pins it off`
+          );
         } else {
           out(`Unrecognised: ${arg}`);
           out('Use: escalate on | escalate off | escalate 10000,40000');
@@ -525,13 +539,20 @@ async function cmdModels(args: string[]): Promise<number> {
         out('No catalog cache found. Run "models fetch" first.');
         return 0;
       }
+      let shown = 0;
       for (const [key, pd] of providers) {
-        if (filter && !pd.id.includes(filter) && !key.toLowerCase().includes(filter)) continue;
+        // `pd.id` is not lowercased upstream, so comparing it against an
+        // already-lowercased filter missed on any provider with a capital.
+        if (filter && !pd.id.toLowerCase().includes(filter) && !key.toLowerCase().includes(filter)) continue;
+        shown++;
         out(`${pd.name} (${pd.id})${pd.configured ? ' — configured' : ''}`);
         printTable(['Model', 'Context', 'Tools', 'Reasoning', 'In/Out $/M'],
           (pd.models || []).map((m) => [m.name, fmt(m.context), m.tool_call ? 'yes' : '—', m.reasoning ? 'yes' : '—', m.is_free ? 'FREE' : `$${m.input_price}/${m.output_price}`]));
         out();
       }
+      // A typo'd --provider used to exit 0 with no output at all, which reads as
+      // a successful empty run.
+      if (!shown) out(filter ? `No provider matches "${filter}".` : 'No providers in the catalog.');
       return 0;
     }
     case 'choose': {
