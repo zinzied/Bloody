@@ -31,11 +31,22 @@ Auto-detects the right filter — no manual selector needed. Safe: falls back to
 #### Tool-Result Head/Tail Pruning
 When tool output exceeds 8192 characters, keeps the first 4096 chars + `[... tool result middle pruned ...]` + last 1024 chars. Model-free (no LLM call needed) — just character slicing.
 
-#### Caveman / Ponytail Mode
+#### Caveman / Ponytail Mode — always on while the proxy runs
+
+Output tokens are the expensive ones, so the proxy appends a terse-output system prompt to **every chat request** while it is running:
+
 - **Caveman Mode** — terse-output system prompts (6 levels: lite → ultra, including Wenyan classical Chinese)
 - **Ponytail Mode** — "lazy senior dev" persona: biases toward stdlib, native features, minimal code
 - Up to **65% output token savings** with aggressive levels
 - Format-aware injection: works with OpenAI, Claude, and Gemini request formats
+- **On by default** (`caveman-lite`) — the prompt costs ~250 input tokens per request and is tracked separately (`style_tokens` in proxy history, so `saved_tokens` keeps meaning "saved by compression")
+- **Cache-friendly by construction**: the prompt is a frozen constant, so the bytes are identical on every request, and for Claude requests it is placed *inside* the cached prefix — before an existing `cache_control` breakpoint if there is one, otherwise as the breakpoint itself. So the ~250 tokens are a cache read, not re-sent input
+- **Context-aware escalation** (on by default): a flat level either wastes tokens early in a session (short context, replies could afford detail) or under-saves later. The level steps *up* the ladder as the request's own context grows — `caveman-lite` → `caveman-full` at 20k tokens → `caveman-ultra` at 60k. It never downgrades and never crosses a family or register boundary (Wenyan stays Wenyan, Ponytail stays Ponytail)
+- Injected once per request (idempotent) — a request that already carries the style is left alone, and escalating onto a body that already has a level of the same family will not stack a second, contradictory prompt
+- Chat endpoints only: `/chat/completions`, `/responses`, `/messages` and Gemini `:generateContent`. Embeddings, model lists and audio calls pass through untouched
+- Change the level: `token-saver proxy style ponytail-full` · HTTP: `POST /api/style` · TUI: press `y` on the Proxy page
+- Tune or pin the escalation: `token-saver proxy style escalate off` (pin the level) · `token-saver proxy style escalate 10000,40000,90000` · HTTP: `POST /api/style {"escalate": false}` · TUI: press `u` · env: `TOKENSAVER_OUTPUT_STYLE_ESCALATE=off`, `TOKENSAVER_OUTPUT_STYLE_ESCALATE_AT=20000,60000`
+- Kill switch: `TOKENSAVER_OUTPUT_STYLE=off` or `token-saver proxy style off`
 
 #### Compaction Checkpoint Format
 Structured Markdown checkpoint for conversation summarization:
@@ -54,6 +65,7 @@ Heuristic token pricing without actual tokenization:
 Local HTTP proxy that compresses API requests before they reach the model:
 
 - **Cost-aware compression**: aggressively compresses requests for expensive models, moderate for mid-range, minimal for cheap/free
+- **Always-on output style**: terse-output prompt injected into every chat request while the proxy runs, escalating its level as the request context grows (see Caveman / Ponytail Mode)
 - **Auto-proxy all providers**: detects configured providers and adds them to the proxy automatically
 - **Bare model routing**: maps bare model IDs to their real provider via catalog
 - **Provider prefix stripping**: strips `opencode/big-pickle` → `big-pickle` before forwarding

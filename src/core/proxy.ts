@@ -12,8 +12,9 @@ import { QuotaTracker, parse_rate_limit_headers } from './quota.js';
 import * as index from './index.js';
 import * as tokens from './tokens.js';
 import * as budget from './budget.js';
+import * as prompts from './prompts.js';
 import { initControlApi, emitEvent, EVENT_TOPICS, handleControlApi } from './control-api.js';
-import type { CompressStats, ProxyConfig, ProxyStatus, RequestBody } from './types.js';
+import type { AppliedStyle, CompressStats, ProxyConfig, ProxyStatus, RequestBody } from './types.js';
 
 export const DEFAULT_PORT = 8199;
 
@@ -101,6 +102,8 @@ const _metrics: {
   requestsServed: number;
   totalSavedBytes: number;
   hits: number;
+  styleApplied: number;
+  styleEscalated: number;
   lastModel: string;
   lastAccount: string;
   startedAt: string | null;
@@ -108,10 +111,167 @@ const _metrics: {
   requestsServed: 0,
   totalSavedBytes: 0,
   hits: 0,
+  styleApplied: 0,
+  styleEscalated: 0,
   lastModel: '',
   lastAccount: '',
   startedAt: null,
 };
+
+// ---------------------------------------------------------------------------
+// Output style: ALWAYS ON while the proxy runs (terse-output prompt), unless
+// TOKENSAVER_OUTPUT_STYLE=off or proxy.json says "output_style": "off".
+// Output tokens are the expensive ones, so this runs on every chat request.
+// ---------------------------------------------------------------------------
+let _outputStyle: prompts.OutputStyleSetting = prompts.resolveOutputStyle(process.env.TOKENSAVER_OUTPUT_STYLE);
+let _styleLogged = false;
+// Context-aware escalation: step the level up as the request's own context grows.
+let _styleEscalate = true;
+let _styleEscalateAt: number[] = [...prompts.DEFAULT_ESCALATE_AT];
+let _settingsLoaded = false;
+
+export function outputStyle(): prompts.OutputStyleSetting {
+  ensureSettingsLoaded();
+  return _outputStyle;
+}
+
+/** Whether the level steps up with context size, and at which sizes. */
+export function outputStyleEscalation(): { enabled: boolean; at: number[] } {
+  ensureSettingsLoaded();
+  return { enabled: _styleEscalate, at: [..._styleEscalateAt] };
+}
+
+function _truthyFlag(value: unknown, fallback: boolean): boolean {
+  if (value === undefined || value === null || value === '') return fallback;
+  const v = String(value).trim().toLowerCase();
+  if (['0', 'off', 'false', 'no', 'disabled'].includes(v)) return false;
+  return true;
+}
+
+/** Re-read the escalation policy from env then proxy.json. */
+function loadStyleEscalation(cfg?: ProxyConfig): void {
+  const c = cfg ?? loadConfig();
+  const env = process.env.TOKENSAVER_OUTPUT_STYLE_ESCALATE;
+  const envAt = process.env.TOKENSAVER_OUTPUT_STYLE_ESCALATE_AT;
+  _styleEscalate = _truthyFlag(env !== undefined ? env : c.output_style_escalate, true);
+  _styleEscalateAt = prompts.resolveEscalateAt(
+    envAt !== undefined && envAt !== '' ? envAt : c.output_style_escalate_at
+  );
+}
+
+/**
+ * Resolve and activate an output style. `value === null/undefined` re-reads the
+ * env var, then proxy.json, then falls back to the always-on default.
+ */
+export function setOutputStyle(value?: string | null): prompts.OutputStyleSetting {
+  let wanted = value;
+  if (wanted === undefined || wanted === null || wanted === '') {
+    wanted = process.env.TOKENSAVER_OUTPUT_STYLE || (loadConfig().output_style ?? null);
+  }
+  _outputStyle = prompts.resolveOutputStyle(wanted);
+  loadStyleEscalation();
+  return _outputStyle;
+}
+
+/**
+ * Read the active settings from proxy.json exactly once.
+ *
+ * Both accessors are used by read-only commands (`proxy style`, `/api/style`)
+ * that never go through setOutputStyle(), so without this they would report the
+ * built-in defaults and silently ignore what the user actually saved.
+ */
+function ensureSettingsLoaded(): void {
+  if (_settingsLoaded) return;
+  _settingsLoaded = true;
+  const cfg = loadConfig();
+  if (!_outputStyle || _outputStyle.style === 'caveman') {
+    const wanted = process.env.TOKENSAVER_OUTPUT_STYLE || cfg.output_style;
+    if (wanted) _outputStyle = prompts.resolveOutputStyle(wanted);
+  }
+  loadStyleEscalation(cfg);
+}
+
+/** Turn escalation on/off and optionally set the thresholds. Persisted by callers. */
+export function setOutputStyleEscalation(
+  enabled?: boolean,
+  at?: Array<number | string> | null
+): { enabled: boolean; at: number[] } {
+  const cfg = loadConfig();
+  if (enabled !== undefined) _styleEscalate = !!enabled;
+  else _styleEscalate = _truthyFlag(process.env.TOKENSAVER_OUTPUT_STYLE_ESCALATE, cfg.output_style_escalate ?? true);
+  if (at && at.length) _styleEscalateAt = prompts.resolveEscalateAt(at);
+  else _styleEscalateAt = prompts.resolveEscalateAt(cfg.output_style_escalate_at);
+  return { enabled: _styleEscalate, at: [..._styleEscalateAt] };
+}
+
+/** Chat/completion endpoints only — never touch embeddings, models or audio calls. */
+export function styleEligible(pathOnly: string, body: RequestBody | null | undefined): boolean {
+  if (!body || typeof body !== 'object') return false;
+  const p = canonicalEndpoint(pathOnly || '');
+  const chatish =
+    p === '/chat/completions' ||
+    p === '/responses' ||
+    p === '/messages' ||
+    p === '/completions' ||
+    /:generatecontent$/i.test(pathOnly || '') ||
+    /\/messages$/i.test(pathOnly || '');
+  if (!chatish) return false;
+
+  if (typeof body.system === 'string' || Array.isArray(body.system)) return true;
+  if (typeof body.instructions === 'string') return true;
+  if (body.system_instruction || body.systemInstruction) return true;
+  const req = body.request;
+  if (req && typeof req === 'object' && ((req as Record<string, unknown>).contents || (req as Record<string, unknown>).content)) return true;
+  // OpenAI / Anthropic style message arrays must hold objects (never string arrays,
+  // which is what an embeddings payload looks like).
+  const arr = Array.isArray(body.messages) ? body.messages : Array.isArray(body.input) ? body.input : null;
+  if (!arr || arr.length === 0) return false;
+  return typeof arr[0] === 'object' && arr[0] !== null;
+}
+
+/**
+ * Inject the always-on output style, escalating the level when the request's own
+ * context is already large. Returns what was actually injected, or null.
+ */
+function applyAlwaysOnStyle(pathOnly: string, body: RequestBody | null | undefined): AppliedStyle | null {
+  if (!_outputStyle || _outputStyle.style === 'off') return null;
+  if (!styleEligible(pathOnly, body)) return null;
+  try {
+    // Measure the request BEFORE injecting, so the level tracks the real context
+    // the model is already carrying and not our own prompt.
+    let contextTokens = 0;
+    try {
+      contextTokens = tokens.estimate_request_tokens_accurate(body as never);
+    } catch {}
+    const effective = _styleEscalate
+      ? prompts.escalateOutputStyle(_outputStyle, contextTokens, _styleEscalateAt)
+      : _outputStyle;
+    const applied = prompts.apply_output_style(body as RequestBody, effective);
+    if (applied) {
+      if (!_styleLogged) {
+        _styleLogged = true;
+        const ladder = prompts.styleLadder(_outputStyle);
+        const top = ladder ? ladder[ladder.length - 1] : null;
+        const escalation =
+          _styleEscalate && top && top !== _outputStyle.level
+            ? ` → up to ${_outputStyle.style}-${top} past ${_styleEscalateAt.join('/')} tok`
+            : '';
+        console.log(
+          `[style] output style ON: ${_outputStyle.label}${escalation} (set TOKENSAVER_OUTPUT_STYLE=off to disable)`
+        );
+      }
+      return {
+        label: effective.label,
+        base: _outputStyle.label,
+        tokens: tokens.count_tokens(effective.prompt) + tokens.BLOCK_OVERHEAD,
+        escalated: effective.label !== _outputStyle.label,
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 export const accountManager = new routing.AccountManager();
 export const quotaTracker = new QuotaTracker();
@@ -437,11 +597,17 @@ function recordHistory(
   stats: CompressStats | null,
   upstreamUrl: string,
   rawBody: string,
-  outBody: string
+  outBody: string,
+  style: AppliedStyle | null = null
 ): void {
   try {
     const cfg = loadConfig();
-    const { rawTokens, savedTokens } = computeTokenSavings(rawBody, outBody);
+    const { rawTokens, outTokens } = computeTokenSavings(rawBody, outBody);
+    // The always-on output style adds a small prompt to every request. Keep that
+    // cost out of the compression savings (reported on its own) so `saved_tokens`
+    // keeps meaning "tokens saved by compressing your request".
+    const styleTokens = style ? style.tokens : 0;
+    const savedTokens = Math.max(0, rawTokens - Math.max(0, outTokens - styleTokens));
     const saved = stats ? Math.max(0, stats.bytesBefore - stats.bytesAfter) : 0;
     const history = cfg.history || [];
     history.push({
@@ -453,6 +619,9 @@ function recordHistory(
       upstream: upstreamUrl,
       timestamp: Math.floor(Date.now() / 1000),
       ts_iso: nowIso(),
+      output_style: style ? style.label : 'off',
+      style_tokens: styleTokens,
+      style_escalated: style ? style.escalated : false,
     });
     saveConfig({
       ...cfg,
@@ -478,7 +647,8 @@ function forward(
   pathOnly: string,
   modelId: string,
   stats: CompressStats | null,
-  account: routing.Account | null
+  account: routing.Account | null,
+  style: AppliedStyle | null = null
 ): void {
   const u = new URL(upstreamUrl);
   const transport = u.protocol === 'https:' ? https : http;
@@ -547,7 +717,7 @@ function forward(
             { method: 'POST', headers: { ...pick(), 'Content-Length': String(Buffer.byteLength(rawBody)) } },
             (res2) => {
               streamBack(res2, res);
-              recordHistory(pathOnly, modelId, stats, upstreamUrl, rawBody, outBody);
+              recordHistory(pathOnly, modelId, stats, upstreamUrl, rawBody, outBody, null);
               finish(res2.statusCode || 0, res2);
             }
           );
@@ -563,7 +733,7 @@ function forward(
           return;
         }
         streamBack(upRes, res);
-        recordHistory(pathOnly, modelId, stats, upstreamUrl, rawBody, outBody);
+        recordHistory(pathOnly, modelId, stats, upstreamUrl, rawBody, outBody, style);
         finish(upRes.statusCode || 0, upRes);
       }
     );
@@ -748,9 +918,18 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     _metrics.lastModel = modelId || 'unknown';
     if (account) _metrics.lastAccount = account.id;
 
+    // Always-on output style (terse replies = fewer output tokens, the expensive
+    // ones). Runs on every chat request while the proxy is up, escalating the
+    // level once the request's own context is large.
+    const appliedStyle = applyAlwaysOnStyle(pathOnly, data);
+    if (appliedStyle) {
+      _metrics.styleApplied += 1;
+      if (appliedStyle.escalated) _metrics.styleEscalated += 1;
+    }
+
     let outBody = raw;
     let stats: CompressStats | null = null;
-    const forceRewrite = budgetEnforced || !!rateLimitReroutedFrom;
+    const forceRewrite = budgetEnforced || !!rateLimitReroutedFrom || !!appliedStyle;
     if (data) {
       const compressed = rtk.compress_messages(data, true);
       if (compressed) {
@@ -770,7 +949,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       }
     }
 
-    forward(req, res, upstreamUrl, outBody, raw, pathOnly, modelId, stats, account);
+    forward(req, res, upstreamUrl, outBody, raw, pathOnly, modelId, stats, account, appliedStyle);
   });
 }
 
@@ -793,6 +972,10 @@ export function status(): ProxyStatus {
     proxiedProviders: cfg.proxied_providers || [],
     upstreams: cfg.upstreams || {},
     caps: rtk.get_filter_caps(),
+    outputStyle: _outputStyle.style === 'off' ? 'off' : _outputStyle.label,
+    outputStyleApplied: _metrics.styleApplied,
+    outputStyleEscalate: _styleEscalate,
+    outputStyleEscalated: _metrics.styleEscalated,
   };
 }
 
@@ -927,6 +1110,15 @@ export function start(port?: number): Promise<ProxyStatus> {
     if (process.env.TOKENSAVER_RATELIMIT_FALLBACK === undefined) process.env.TOKENSAVER_RATELIMIT_FALLBACK = '1';
     const targetPort = port !== undefined && port !== null ? port : loadConfig().port || DEFAULT_PORT;
     rtk.set_filter_caps && rtk.set_filter_caps(loadConfig().caps || {});
+    // Output style is ALWAYS ON while the proxy runs (terse replies = fewer output
+    // tokens). Override with TOKENSAVER_OUTPUT_STYLE or proxy.json "output_style".
+    const style = setOutputStyle(undefined);
+    _styleLogged = false;
+    console.log(
+      style.style === 'off'
+        ? '[style] output style OFF — responses will be at full length'
+        : `[style] output style: ${style.label} (always on while the proxy runs · ~${tokens.count_tokens(style.prompt)} tokens/request · TOKENSAVER_OUTPUT_STYLE=off to disable)`
+    );
     const proxify = ensureProxiedProviders(targetPort, true);
     if (proxify.rewritten.length) {
       console.log(`[proxy] routed through proxy: ${proxify.rewritten.join(', ')} (restart opencode if running)`);

@@ -173,16 +173,30 @@ export function inject_system_prompt(body: RequestBody, prompt: string): void {
       return;
     }
     if (Array.isArray(body.system)) {
-      const block = { type: 'text', text: prompt };
+      // Cache-friendly placement. The prompt bytes are constant, so it belongs
+      // inside the cached prefix:
+      //  - a cache_control already exists → slide in just before the last one, so
+      //    the style is covered by the breakpoint the client already pays for
+      //    (and no extra breakpoint is spent);
+      //  - none exists → make our own block the breakpoint, so the whole stable
+      //    system prefix becomes a cache read on the next turn instead of ~250
+      //    re-sent tokens.
       let lastCacheIdx = -1;
+      let breakpoints = 0;
       for (let i = body.system.length - 1; i >= 0; i--) {
         if (body.system[i].cache_control) {
           lastCacheIdx = i;
-          break;
+          breakpoints++;
         }
       }
-      if (lastCacheIdx >= 0) body.system.splice(lastCacheIdx, 0, block);
-      else body.system.push(block);
+      for (let i = 0; i < body.system.length; i++) {
+        if (i < lastCacheIdx && body.system[i].cache_control) breakpoints++;
+      }
+      const block: Record<string, unknown> = { type: 'text', text: prompt };
+      // Anthropic accepts at most 4 cache breakpoints; never risk a 400.
+      if (breakpoints === 0) block.cache_control = { type: 'ephemeral' };
+      if (lastCacheIdx >= 0) body.system.splice(lastCacheIdx, 0, block as never);
+      else body.system.push(block as never);
       return;
     }
     body.system = prompt;
@@ -238,6 +252,251 @@ export function inject_caveman(body: RequestBody, level = 'lite'): void {
 export function inject_ponytail(body: RequestBody, level = 'lite'): void {
   const prompt = PONYTAIL_PROMPTS[level];
   if (prompt) inject_system_prompt(body, prompt);
+}
+
+// ---------------------------------------------------------------------------
+// Output style (terse-output prompt) — applied by the proxy to every chat
+// request while it runs. Output tokens cost 3-8x input tokens, so this is the
+// highest-leverage saving available. Kill switch: TOKENSAVER_OUTPUT_STYLE=off
+// ---------------------------------------------------------------------------
+export const DEFAULT_OUTPUT_STYLE = 'caveman-lite';
+
+export interface OutputStyleSetting {
+  /** normalized input value: 'caveman-lite', 'ponytail-ultra', 'off', … */
+  raw: string;
+  style: 'off' | 'caveman' | 'ponytail';
+  level: string;
+  /** display label: 'caveman-lite' | 'ponytail-full' | 'off' */
+  label: string;
+  /** system prompt text; empty when the style is off */
+  prompt: string;
+}
+
+const OUTPUT_STYLE_OFF_VALUES = new Set(['off', 'none', 'false', 'no', '0', 'disabled']);
+
+/**
+ * Normalize a user/env/config value into a usable output style.
+ * Unknown levels fall back to `lite` of the requested family; anything empty or
+ * unrecognized falls back to DEFAULT_OUTPUT_STYLE (caveman-lite, always on).
+ */
+export function resolveOutputStyle(value?: string | null): OutputStyleSetting {
+  const raw = String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/_/g, '-');
+  const wanted = raw || DEFAULT_OUTPUT_STYLE;
+
+  if (OUTPUT_STYLE_OFF_VALUES.has(wanted)) {
+    return { raw: 'off', style: 'off', level: '', label: 'off', prompt: '' };
+  }
+
+  let style: 'caveman' | 'ponytail' = 'caveman';
+  let level = wanted;
+  if (wanted.startsWith('ponytail')) {
+    style = 'ponytail';
+    level = wanted.slice('ponytail'.length).replace(/^-/, '');
+  } else if (wanted.startsWith('caveman')) {
+    level = wanted.slice('caveman'.length).replace(/^-/, '');
+  }
+
+  const table = style === 'ponytail' ? PONYTAIL_PROMPTS : CAVEMAN_PROMPTS;
+  if (!level || !table[level]) level = 'lite';
+
+  return { raw: wanted, style, level, label: `${style}-${level}`, prompt: table[level] || '' };
+}
+
+/**
+ * Stable, per-level dedupe markers.
+ *
+ * The prompt text itself is a frozen module constant, so the bytes are already
+ * identical on every request — that is what keeps the injected block inside the
+ * provider's prompt cache. The marker has to be stable for the same reason, and
+ * it has to be UNIQUE per level: a fixed `slice(0, 40)` collides badly here,
+ * because all three ponytail levels start with the identical sentence
+ * "You are a lazy senior developer. Lazy means efficient…". Two different levels
+ * then looked "already applied", and an escalated level would be silently skipped.
+ *
+ * So: take the shortest prefix that no sibling level shares.
+ */
+function _uniquePrefix(prompt: string, siblings: string[]): string {
+  if (!prompt) return '';
+  let cut = prompt.length;
+  for (const other of siblings) {
+    if (other === prompt) continue;
+    let i = 0;
+    const max = Math.min(other.length, prompt.length);
+    while (i < max && other[i] === prompt[i]) i++;
+    if (i < cut) cut = i;
+  }
+  return prompt.slice(0, Math.min(cut + 1, prompt.length));
+}
+
+const _styleMarkers = new Map<string, string>();
+
+/** Short, stable snippet that identifies exactly this level. */
+export function outputStyleMarker(setting: OutputStyleSetting): string {
+  if (!setting || !setting.prompt) return '';
+  const cached = _styleMarkers.get(setting.label);
+  if (cached) return cached;
+  const table = setting.style === 'ponytail' ? PONYTAIL_PROMPTS : CAVEMAN_PROMPTS;
+  const siblings = Object.values(table);
+  const marker = _uniquePrefix(setting.prompt, siblings);
+  _styleMarkers.set(setting.label, marker);
+  return marker;
+}
+
+/** Every string the model sees as instructions, across all supported formats. */
+function _systemStrings(body: RequestBody): string[] {
+  const out: string[] = [];
+  if (!body || typeof body !== 'object') return out;
+
+  const push = (v: unknown): void => {
+    if (typeof v === 'string' && v) out.push(v);
+  };
+  const pushParts = (holder: unknown): void => {
+    if (!holder || typeof holder !== 'object') return;
+    const parts = (holder as Record<string, unknown>).parts;
+    if (Array.isArray(parts)) {
+      for (const p of parts) push((p as Record<string, unknown>)?.text);
+    }
+  };
+
+  push(body.system);
+  if (Array.isArray(body.system)) {
+    for (const b of body.system) push((b as Record<string, unknown>)?.text);
+  }
+  push(body.instructions);
+  pushParts(body.system_instruction);
+  pushParts(body.systemInstruction);
+
+  const req = body.request;
+  if (req && typeof req === 'object') {
+    pushParts((req as Record<string, unknown>).system_instruction);
+    pushParts((req as Record<string, unknown>).systemInstruction);
+  }
+
+  const arr = Array.isArray(body.messages) ? body.messages : Array.isArray(body.input) ? body.input : null;
+  if (arr) {
+    for (const m of arr) {
+      if (!m || typeof m !== 'object') continue;
+      const role = (m as Record<string, unknown>).role;
+      if (role !== 'system' && role !== 'developer') continue;
+      const content = (m as Record<string, unknown>).content;
+      if (typeof content === 'string') out.push(content);
+      else if (Array.isArray(content)) {
+        for (const b of content) push((b as Record<string, unknown>)?.text);
+      }
+    }
+  }
+
+  return out;
+}
+
+/** True when the style prompt is already part of the request (never inject twice). */
+export function has_output_style(body: RequestBody, setting: OutputStyleSetting): boolean {
+  const marker = outputStyleMarker(setting);
+  if (!marker) return false;
+  return _systemStrings(body).some((text) => text.includes(marker));
+}
+
+/**
+ * True when the request already carries ANY level of this style family.
+ *
+ * Needed because escalation can hand us a body that already has the milder base
+ * level in it (a client that echoes its system prompt back, or a retry of a body
+ * we already touched). Matching on the exact level alone would then append a
+ * second, conflicting style prompt instead of recognising the existing one.
+ */
+export function has_any_output_style(body: RequestBody, setting: OutputStyleSetting): boolean {
+  if (!setting || setting.style === 'off') return false;
+  const table = setting.style === 'ponytail' ? PONYTAIL_PROMPTS : CAVEMAN_PROMPTS;
+  const family = Object.values(table).map((p) => _uniquePrefix(p, Object.values(table)));
+  const strings = _systemStrings(body);
+  return family.some((marker) => marker && strings.some((text) => text.includes(marker)));
+}
+
+/**
+ * Idempotently apply the output style to a chat request.
+ * Returns true only when the prompt actually landed in the body.
+ */
+export function apply_output_style(body: RequestBody, setting: OutputStyleSetting): boolean {
+  if (!body || !setting || setting.style === 'off' || !setting.prompt) return false;
+  if (has_output_style(body, setting)) return false;
+  // A different level of the same family is already there — leave it alone rather
+  // than stacking a second, contradictory style prompt.
+  if (has_any_output_style(body, setting)) return false;
+  inject_system_prompt(body, setting.prompt);
+  return has_output_style(body, setting);
+}
+
+// ---------------------------------------------------------------------------
+// Context-aware escalation
+//
+// A flat level either wastes output tokens early in a session (short context,
+// replies could afford detail) or under-saves later (long context, everything
+// is already expensive). Stepping the level up as the request's own context
+// grows gets most of the saving at a fraction of the flat cost.
+//
+// Escalation only ever moves UP the ladder, and never crosses a register
+// boundary: 'caveman-lite' may become 'caveman-full'/'caveman-ultra' but never
+// silently switches to Wenyan, and ponytail never turns caveman.
+// ---------------------------------------------------------------------------
+
+/** Ladders, mildest → most aggressive. Keys are `<family>` or `<family>:<register>`. */
+export const OUTPUT_STYLE_LADDERS: Record<string, string[]> = {
+  caveman: ['lite', 'full', 'ultra'],
+  'caveman:wenyan': ['wenyan-lite', 'wenyan', 'wenyan-ultra'],
+  ponytail: ['lite', 'full', 'ultra'],
+};
+
+/** Context sizes (tokens) at which the level steps up one rung. */
+export const DEFAULT_ESCALATE_AT: readonly number[] = [20000, 60000];
+
+/** The ladder a setting belongs to, or null when its level isn't on one. */
+export function styleLadder(setting: OutputStyleSetting): string[] | null {
+  if (!setting || setting.style === 'off') return null;
+  const register = setting.level.startsWith('wenyan') ? ':wenyan' : '';
+  return OUTPUT_STYLE_LADDERS[`${setting.style}${register}`] || null;
+}
+
+/** Sanitize a user/config threshold list: positive, ascending, at most ladder length. */
+export function resolveEscalateAt(value?: unknown): number[] {
+  const raw = Array.isArray(value) ? value : typeof value === 'string' ? value.split(',') : [];
+  const nums = raw
+    .map((v) => Number(String(v).trim()))
+    .filter((n) => Number.isFinite(n) && n > 0)
+    .sort((a, b) => a - b);
+  return nums.length ? nums : [...DEFAULT_ESCALATE_AT];
+}
+
+/**
+ * Step the configured level up according to how large the request's own context
+ * already is. Never downgrades, never leaves the ladder, returns the input
+ * setting untouched when escalation is off or the level is unknown.
+ */
+export function escalateOutputStyle(
+  setting: OutputStyleSetting,
+  contextTokens: number,
+  thresholds: readonly number[] = DEFAULT_ESCALATE_AT
+): OutputStyleSetting {
+  if (!setting || setting.style === 'off' || !setting.prompt) return setting;
+  if (!Number.isFinite(contextTokens) || contextTokens <= 0) return setting;
+  const ladder = styleLadder(setting);
+  if (!ladder) return setting;
+  const idx = ladder.indexOf(setting.level);
+  if (idx < 0) return setting;
+
+  const t = resolveEscalateAt(thresholds as unknown[]);
+  let steps = 0;
+  for (const threshold of t) {
+    if (contextTokens >= threshold) steps++;
+    else break;
+  }
+  if (steps <= 0) return setting;
+
+  const next = ladder[Math.min(ladder.length - 1, idx + steps)];
+  if (!next || next === setting.level) return setting;
+  return resolveOutputStyle(`${setting.style}-${next}`);
 }
 
 export const COMPACTION_CHECKPOINT_INSTRUCTION = `You are generating a structured conversation checkpoint. Condense the conversation into a concise checkpoint using EXACTLY this Markdown structure:

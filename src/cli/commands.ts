@@ -32,6 +32,11 @@ COMMANDS
   proxy proxify [--port N]          auto-add all configured providers to the proxy
   proxy enable [--port N]           enable auto-start
   proxy disable                     disable auto-start
+  proxy style [level]               terse-output style (always on while the proxy runs):
+                                    off | caveman-lite(default) | caveman-full | caveman-ultra |
+                                    caveman-wenyan | ponytail-lite | ponytail-full
+  proxy style escalate [on|off|at]   step the level up as the request context grows
+                                    (e.g. escalate 10000,40000 — off pins the level)
   proxy test                        test proxy health + upstream forward
 proxy restore                     restore direct provider URLs (use if the proxy died and opencode is stuck)
   accounts list                     list proxy accounts
@@ -340,6 +345,10 @@ async function cmdProxy(args: string[]): Promise<number> {
       out(`Requests    : ${fmt(s.requestsServed)}`);
       out(`Hits        : ${fmt(s.compressionHits)}`);
       out(`Bytes saved : ${fmt(s.totalSavedBytes)}B`);
+      out(`Output style: ${s.outputStyle === 'off' ? 'off (verbose responses)' : `${s.outputStyle} — always on (${fmt(s.outputStyleApplied)} request(s) shortened)`}`);
+      if (s.outputStyle !== 'off' && s.outputStyleEscalate) {
+        out(`Escalation  : on (${fmt(s.outputStyleEscalated ?? 0)} request(s) ran a step hotter as context grew)`);
+      }
       if (s.lastModel) out(`Last model  : ${s.lastModel}`);
       if (s.proxiedProviders?.length) out(`Proxied     : ${s.proxiedProviders.join(', ')}`);
       const curPid = proxy.modelProvider(config.get_current_model());
@@ -382,6 +391,68 @@ async function cmdProxy(args: string[]): Promise<number> {
     case 'enable': {
       proxy.enable(true, flags.port ? Number(flags.port) : undefined);
       out('Auto-start enabled.');
+      return 0;
+    }
+    case 'style': {
+      const requested = positionals.slice(1).join(' ').trim();
+      // `style escalate <off|on|10000,60000>` — pin the level or retune the ladder.
+      if (/^escalate(\s|$)/i.test(requested)) {
+        const arg = requested.replace(/^escalate/i, '').trim();
+        const esc = proxy.outputStyleEscalation();
+        if (!arg) {
+          out(`Escalation  : ${esc.enabled ? 'on' : 'off'}`);
+          out(`At          : ${esc.at.join(', ')} tokens (steps the level up at each size)`);
+          out('Example     : token-saver proxy style escalate off | on | 10000,40000,90000');
+          return 0;
+        }
+        const cfg = proxy.loadConfig();
+        // The alternation must be grouped, otherwise `^1` alone matches "10000,40000"
+        // and the custom thresholds would be silently discarded for `on`.
+        if (/^(off|0|false|no)$/i.test(arg)) {
+          proxy.setOutputStyleEscalation(false);
+          cfg.output_style_escalate = false;
+          proxy.saveConfig(cfg);
+          out('Output style escalation off — the level is pinned.');
+        } else if (/^(on|1|true|yes)$/i.test(arg)) {
+          proxy.setOutputStyleEscalation(true);
+          cfg.output_style_escalate = true;
+          proxy.saveConfig(cfg);
+          out('Output style escalation on.');
+        } else if (/^[\d\s,.]+$/.test(arg)) {
+          const next = proxy.setOutputStyleEscalation(undefined, arg.split(','));
+          cfg.output_style_escalate = next.enabled;
+          cfg.output_style_escalate_at = next.at;
+          proxy.saveConfig(cfg);
+          out(`Escalation  : on — level steps up at ${next.at.join(', ')} tokens`);
+        } else {
+          out(`Unrecognised: ${arg}`);
+          out('Use: escalate on | escalate off | escalate 10000,40000');
+          return 1;
+        }
+        const s = proxy.status();
+        out(`Output style: ${s.outputStyle}`);
+        return 0;
+      }
+      if (!requested) {
+        const s = proxy.status();
+        const esc = proxy.outputStyleEscalation();
+        out(`Output style: ${s.outputStyle}`);
+        out(`Applied to  : ${fmt(s.outputStyleApplied)} request(s)`);
+        if (s.outputStyleEscalate) {
+          out(`Escalation  : on — past ${esc.at.join('/')} tokens the level steps up (${fmt(s.outputStyleEscalated ?? 0)} request(s) escalated)`);
+          out(`             off with: token-saver proxy style escalate off`);
+        } else {
+          out('Escalation  : off (level pinned)');
+        }
+        out('Levels      : off | caveman-lite (default) | caveman-full | caveman-ultra | caveman-wenyan | ponytail-lite');
+        out('Always on while the proxy runs. Changes are saved to proxy.json and apply immediately.');
+        return 0;
+      }
+      const setting = proxy.setOutputStyle(requested);
+      const cfg = proxy.loadConfig();
+      proxy.saveConfig({ ...cfg, output_style: setting.raw });
+      out(`Output style: ${setting.label}${setting.label === 'off' ? ' — responses will be at full length' : ''}`);
+      out('Applied to every chat request while the proxy runs.');
       return 0;
     }
     case 'disable': {
@@ -671,6 +742,7 @@ function cmdDoctor(args: string[]): number {
   out(`Doctor — ${d.ok ? 'OK' : `${d.issues.length} issue(s)`}${fix ? ' (fix applied where safe)' : ''}`);
   out(`Model: ${d.currentModel || '—'}  Tokenizer: ${d.tokenizer.available ? `✓ ${d.tokenizer.encoding}` : '⚠ heuristic'}`);
   out(`Proxy: ${d.proxy.enabled ? `enabled :${d.proxy.port} proxied=${(d.proxy.proxied_providers||[]).join(',')||'—'}` : 'disabled'}`);
+  out(`Output style: ${d.outputStyle === 'off' ? 'off — responses stay at full length' : `${d.outputStyle} (always on while the proxy runs)`}`);
   out(`Budget: ${d.budgetStatus ? `${(d.budgetStatus as any).spentTokens} tok today / ${(d.budgetStatus as any).policy.free_daily_token_limit} limit — ${(d.budgetStatus as any).limitReached ? 'LIMIT REACHED' : 'ok'} · decision: ${(d.budgetStatus as any).decision?.choice || 'not answered (proxy not blocked)'}` : '—'}`);
   out();
   if (d.issues.length) {

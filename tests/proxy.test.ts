@@ -131,7 +131,12 @@ test('proxy compresses outgoing tool results', async () => {
     assert.strictEqual(s.status, 200);
     assert.ok(JSON.parse(s.body).id === 'x');
     const parsed = JSON.parse(receivedBody!);
-    assert.ok(parsed.messages[2].content.length < toolResult.length);
+    // the proxy also injects the always-on terse-output system prompt, so look the
+    // tool result up by role instead of by a fixed index
+    const toolMsg = parsed.messages.find((m: any) => m.role === 'tool');
+    assert.ok(toolMsg, 'the tool result must be forwarded');
+    assert.ok(toolMsg.content.length < toolResult.length);
+    assert.strictEqual(parsed.messages[0].role, 'system', 'the output style prompt is always applied');
     const st = proxy.status();
     assert.strictEqual(st.requestsServed, 1);
     assert.strictEqual(st.compressionHits, 1);
@@ -171,7 +176,11 @@ test('proxy retries with original body when upstream returns 400', async () => {
     const s = await post(proxy.status().port!, '/v1/chat/completions', body);
     assert.strictEqual(s.status, 200);
     assert.strictEqual(calls, 2);
-    assert.ok(bodies[0].length < body.length);
+    // the first attempt sends the rewritten body (compressed tool result + always-on style)
+    assert.notStrictEqual(bodies[0], body);
+    const firstTool = JSON.parse(bodies[0]).messages.find((m: any) => m.role === 'tool');
+    assert.ok(firstTool.content.length < toolResult.length, 'the tool result is still compressed');
+    // the retry must fall back to the original client body, byte for byte
     assert.strictEqual(bodies[1], body);
   } finally {
     await proxy.stop();

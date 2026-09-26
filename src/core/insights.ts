@@ -5,6 +5,7 @@ import * as routingMod from './routing.js';
 import { accountManager, resolveUpstream } from './proxy.js';
 import * as tokens from './tokens.js';
 import * as budgetMod from './budget.js';
+import { resolveOutputStyle } from './prompts.js';
 import { createRequire } from 'node:module';
 import type { SqliteDb, SqliteRow } from './types.js';
 
@@ -444,6 +445,7 @@ export function doctorSummary(opts: { fix?: boolean } = {}) {
     budgetStatus,
     tokenizer,
     proxy: pcfg,
+    outputStyle: resolveOutputStyle(pcfg.output_style ?? process.env.TOKENSAVER_OUTPUT_STYLE).label,
     config: cfg,
     currentModel,
     providers,

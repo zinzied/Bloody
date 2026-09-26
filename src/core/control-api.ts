@@ -193,6 +193,69 @@ async function handleLimits(req: http.IncomingMessage, res: http.ServerResponse,
   });
 }
 
+/**
+ * GET  /api/style → active output style ('off' when disabled) + how many requests it shortened
+ * POST /api/style → change the level with { style: "caveman-lite" | "ponytail-full" | "off" | … }
+ *   optional { escalate: boolean, at: number[] } to control the context-size escalation
+ *
+ * The output style is ALWAYS ON while the proxy runs; this endpoint only picks the
+ * level (it is never used to leave requests uncompressed silently).
+ */
+async function handleStyle(req: http.IncomingMessage, res: http.ServerResponse, _url: URL) {
+  if (req.method === 'GET') {
+    const s = proxy.status();
+    sendJson(res, 200, {
+      outputStyle: s.outputStyle,
+      applied: s.outputStyleApplied,
+      escalated: s.outputStyleEscalated,
+      escalate: s.outputStyleEscalate,
+      escalateAt: proxy.outputStyleEscalation().at,
+      setting: proxy.outputStyle(),
+    });
+    return;
+  }
+  if (req.method !== 'POST') {
+    sendJson(res, 405, { error: 'method not allowed' });
+    return;
+  }
+  let body = '';
+  req.on('data', (chunk) => { body += chunk; });
+  req.on('end', () => {
+    try {
+      const { style, escalate, at } = JSON.parse(body || '{}') as {
+        style?: string;
+        escalate?: boolean;
+        at?: number[];
+      };
+      if (!style && escalate === undefined && at === undefined) {
+        sendJson(res, 400, { error: 'invalid body: expected { style: "caveman-lite" | ... | "off" }' });
+        return;
+      }
+      const cfg = proxy.loadConfig();
+      let setting = proxy.outputStyle();
+      if (style) {
+        setting = proxy.setOutputStyle(style);
+        cfg.output_style = setting.raw;
+      }
+      if (escalate !== undefined || at !== undefined) {
+        const next = proxy.setOutputStyleEscalation(escalate, at);
+        cfg.output_style_escalate = next.enabled;
+        cfg.output_style_escalate_at = next.at;
+      }
+      proxy.saveConfig(cfg);
+      const s = proxy.status();
+      sendJson(res, 200, {
+        ok: true,
+        setting,
+        escalate: s.outputStyleEscalate,
+        escalateAt: proxy.outputStyleEscalation().at,
+      });
+    } catch {
+      sendJson(res, 400, { error: 'invalid body: expected { style: string }' });
+    }
+  });
+}
+
 // ---- Router ----
 const routeHandlers: Record<string, (req: http.IncomingMessage, res: http.ServerResponse, url: URL) => Promise<void>> = {
   '/api/overview': handleOverview,
@@ -207,6 +270,7 @@ const routeHandlers: Record<string, (req: http.IncomingMessage, res: http.Server
   '/api/doctor': handleDoctor,
   '/api/budget': handleBudget,
   '/api/limits': handleLimits,
+  '/api/style': handleStyle,
 };
 
 export async function handleControlApi(

@@ -80,6 +80,26 @@ export function ProxyPage() {
       case 'c':
         runTest();
         return true;
+      case 'y':
+        doAction(async () => {
+          const levels = ['caveman-lite', 'caveman-full', 'ponytail-lite', 'off'];
+          const cur = proxy.outputStyle().label;
+          const next = levels[(levels.indexOf(cur) + 1) % levels.length];
+          proxy.setOutputStyle(next);
+          proxy.saveConfig({ ...proxy.loadConfig(), output_style: next });
+          return next;
+        });
+        return true;
+      case 'u':
+        doAction(async () => {
+          // Toggle the context-size escalation (pin the level / let it step up).
+          const next = !(status?.outputStyleEscalate ?? true);
+          const cfg = proxy.loadConfig();
+          proxy.setOutputStyleEscalation(next);
+          proxy.saveConfig({ ...cfg, output_style_escalate: next });
+          return next ? 'escalation on' : 'escalation off';
+        });
+        return true;
       default:
         return false;
     }
@@ -108,10 +128,25 @@ export function ProxyPage() {
             <Stat label="Requests" value={fmt(status.requestsServed ?? 0)} sub="POSTs through the proxy" />
             <Stat label="Compression hits" value={fmt(status.compressionHits ?? 0)} />
             <Stat label="Bytes saved" value={`${fmt(status.totalSavedBytes ?? 0)}B`} />
+            <Stat
+              label="Output style"
+              value={status.outputStyle === 'off' ? 'Off' : status.outputStyle}
+              color={status.outputStyle === 'off' ? 'red' : 'green'}
+              sub={`always on while running · ${fmt(status.outputStyleApplied ?? 0)} shortened`}
+            />
           </Row>
           {status.lastModel && <Hint>Last model routed: {status.lastModel}</Hint>}
           <Hint>
-            Enter: toggle start/stop · s: start · t: stop · e: enable auto-start · d: disable · c: test connection · p: edit port · q: quit
+            Output style ({status.outputStyle}) is always on while the proxy runs — it appends a terse-output
+            prompt to every chat request so replies (the expensive tokens) stay short.
+          </Hint>
+          <Hint>
+            {status.outputStyleEscalate === false
+              ? 'Escalation off — the level is pinned.'
+              : `Escalation on — ${fmt(status.outputStyleEscalated ?? 0)} request(s) ran a step above the configured level as context grew.`}
+          </Hint>
+          <Hint>
+            Enter: toggle start/stop · s: start · t: stop · e: enable auto-start · d: disable · c: test connection · y: cycle output style · u: toggle escalation · p: edit port · q: quit
           </Hint>
           {editPort && (
             <TextField

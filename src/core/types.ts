@@ -77,6 +77,12 @@ export interface ProxyHistoryEntry {
   saved_tokens?: number;
   saved_bytes?: number;
   frost_saved?: number;
+  /** Terse-output style active for that request ('off' when disabled). */
+  output_style?: string;
+  /** Approximate tokens the injected style prompt added (0 when off). */
+  style_tokens?: number;
+  /** True when the style was escalated above the configured level for a long context. */
+  style_escalated?: boolean;
   upstream?: string;
   timestamp?: number;
   ts_iso?: string;
@@ -95,6 +101,26 @@ export interface ProxyConfig {
   saved_base_urls?: Record<string, string>;
   account_strategy?: string;
   caps?: Record<string, number>;
+  /** Terse-output style applied to every chat request while the proxy runs:
+   *  'caveman-lite' (default), 'caveman-full|ultra|wenyan*', 'ponytail-*', 'off'. */
+  output_style?: string;
+  /** Step the style up as the request's own context grows (default true).
+   *  Set false (or TOKENSAVER_OUTPUT_STYLE_ESCALATE=off) to pin the level. */
+  output_style_escalate?: boolean;
+  /** Context sizes (in tokens) at which the level steps up. Default [20000, 60000]. */
+  output_style_escalate_at?: number[];
+}
+
+/** What the proxy actually injected for one request. */
+export interface AppliedStyle {
+  /** effective level, e.g. 'caveman-full' ('off' when nothing was injected) */
+  label: string;
+  /** the level the user configured, before escalation */
+  base: string;
+  /** approximate tokens the injected prompt added */
+  tokens: number;
+  /** true when the effective level is more aggressive than the configured one */
+  escalated: boolean;
 }
 
 export interface RtkHit {
@@ -122,6 +148,14 @@ export interface ProxyStatus {
   proxiedProviders: string[];
   upstreams: Record<string, string>;
   caps?: Record<string, number | undefined>;
+  /** Active terse-output style ('off' when disabled). */
+  outputStyle: string;
+  /** Number of requests the output style was injected into. */
+  outputStyleApplied: number;
+  /** Whether the level steps up as context grows. */
+  outputStyleEscalate?: boolean;
+  /** Requests that used a level above the configured one. */
+  outputStyleEscalated?: number;
 }
 
 export interface SqliteRow {
