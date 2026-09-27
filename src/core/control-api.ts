@@ -13,6 +13,7 @@ import * as insights from './insights.js';
 import * as proxy from './proxy.js';
 import * as models from './models.js';
 import * as budget from './budget.js';
+import type { ProxyStatus } from './types.js';
 
 const OPEN = 1;
 
@@ -61,6 +62,13 @@ function writeControlFile(port: number, token: string) {
 
 function clearControlFile() {
   try {
+    // Only remove the handshake file if it is still ours. A second process that
+    // failed to bind the port also reaches the close handler, and unlinking
+    // then would lock the live proxy out of its own control API.
+    if (controlToken) {
+      const cur = JSON.parse(fs.readFileSync(CONTROL_FILE, 'utf-8'));
+      if (cur.token !== controlToken) return;
+    }
     fs.unlinkSync(CONTROL_FILE);
   } catch {}
 }
@@ -353,12 +361,72 @@ function initWebSocket(server: http.Server) {
 }
 
 // ---- Public init ----
+/**
+ * Status of the proxy as seen from *another* process. The proxy keeps its
+ * counters in memory, so a TUI that only called proxy.status() reported
+ * "stopped / 0 requests" whenever the proxy was started by the watchdog or the
+ * desktop app instead of by the TUI itself.
+ */
+export async function fetchLiveStatus(): Promise<ProxyStatus | null> {
+  let port = controlPort;
+  let token = controlToken;
+  if (!port || !token) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(CONTROL_FILE, 'utf-8'));
+      port = Number(raw.port);
+      token = raw.token;
+    } catch {
+      return null;
+    }
+  }
+  if (!port || !token) return null;
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v: ProxyStatus | null) => {
+      if (settled) return;
+      settled = true;
+      resolve(v);
+    };
+    const req = http.request(
+      { host: '127.0.0.1', port, path: '/api/status', method: 'GET', headers: { 'X-Token-Saver': token } },
+      (res) => {
+        if (res.statusCode !== 200) {
+          res.resume();
+          return done(null);
+        }
+        let buf = '';
+        res.setEncoding('utf-8');
+        res.on('data', (c) => {
+          buf += c;
+        });
+        res.on('end', () => {
+          try {
+            done(JSON.parse(buf) as ProxyStatus);
+          } catch {
+            done(null);
+          }
+        });
+      }
+    );
+    req.on('error', () => done(null));
+    req.setTimeout(2000, () => {
+      req.destroy();
+      done(null);
+    });
+    req.end();
+  });
+}
+
 export function initControlApi(server: http.Server, port: number) {
   // Generate token
   const token = sha256Hex(Math.random().toString(36).slice(2) + Date.now().toString(36));
   controlToken = token;
   controlPort = port;
-  writeControlFile(port, token);
+  // Written on 'listening', not here: a process that loses the bind race emits
+  // 'error' and exits, and writing here would hand its token to callers while
+  // the real proxy on that port keeps running with a different one.
+  server.once('listening', () => writeControlFile(port, token));
 
   // Init WS
   initWebSocket(server);

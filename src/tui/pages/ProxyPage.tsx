@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { Page, Row, Stat, Hint, ErrorLine, TextField, fmt, uptime } from '../components.js';
 import { useScreenInput } from '../input.js';
 import * as proxy from '../../core/proxy.js';
+import { fetchLiveStatus } from '../../core/control-api.js';
 import type { ProxyStatus } from '../../core/types.js';
 
 export function ProxyPage() {
@@ -13,12 +14,20 @@ export function ProxyPage() {
   const [test, setTest] = useState<any>(null);
 
   const refresh = useCallback(() => {
-    try {
-      setStatus(proxy.status());
+    const local = proxy.status();
+    // The proxy usually runs in its own process (watchdog / desktop app), so
+    // local counters are empty. Ask the live one before reporting "stopped".
+    if (local.running) {
+      setStatus(local);
       setError('');
-    } catch (e) {
-      setError(String((e as Error).message || e));
+      return;
     }
+    fetchLiveStatus()
+      .then((live) => {
+        setStatus(live && live.running ? live : local);
+        setError('');
+      })
+      .catch((e) => setError(String((e as Error).message || e)));
   }, []);
 
   useEffect(() => {

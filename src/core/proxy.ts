@@ -13,7 +13,7 @@ import * as index from './index.js';
 import * as tokens from './tokens.js';
 import * as budget from './budget.js';
 import * as prompts from './prompts.js';
-import { initControlApi, emitEvent, EVENT_TOPICS, handleControlApi } from './control-api.js';
+import { initControlApi, emitEvent, EVENT_TOPICS, handleControlApi, fetchLiveStatus } from './control-api.js';
 import type { AppliedStyle, CompressStats, ProxyConfig, ProxyStatus, RequestBody } from './types.js';
 
 export const DEFAULT_PORT = 8199;
@@ -1560,37 +1560,56 @@ export function start(port?: number): Promise<ProxyStatus> {
   return new Promise((resolve, reject) => {
     if (_server) return resolve(status());
     // Daily limits never block by default: the user answers "reset" / "stay blocked" from the UI.
-    // Set TOKENSAVER_BUDGET_ENFORCE=0 to hard-disable the guard even after the user opted in.
+    // Set TOKENSAVER_BUDGET_ENFORCE=0 to hard-disable the guard even after you opted in.
     if (process.env.TOKENSAVER_RATELIMIT_FALLBACK === undefined) process.env.TOKENSAVER_RATELIMIT_FALLBACK = '1';
     const targetPort = port !== undefined && port !== null ? port : loadConfig().port || DEFAULT_PORT;
-    rtk.set_filter_caps && rtk.set_filter_caps(loadConfig().caps || {});
-    // Output style is ALWAYS ON while the proxy runs (terse replies = fewer output
-    // tokens). Override with TOKENSAVER_OUTPUT_STYLE or proxy.json "output_style".
-    const style = setOutputStyle(undefined);
-    _styleLogged = false;
-    console.log(
-      style.style === 'off'
-        ? '[style] output style OFF — responses will be at full length'
-        : `[style] output style: ${style.label} (always on while the proxy runs · ~${tokens.count_tokens(style.prompt)} tokens/request · TOKENSAVER_OUTPUT_STYLE=off to disable)`
-    );
-    const proxify = ensureProxiedProviders(targetPort, true);
-    if (proxify.rewritten.length) {
-      console.log(`[proxy] routed through proxy: ${proxify.rewritten.join(', ')} (restart opencode if running)`);
-    }
-    const server = http.createServer(handleRequest);
-    server.on('error', (e) => {
-      _server = null;
-      reject(e);
-    });
-    // Initialize control API (REST + WS) on the same server
-    initControlApi(server, targetPort);
-    server.listen(targetPort, '127.0.0.1', () => {
-      _server = server;
-      _port = (server.address() as any).port as number;
-      _metrics.startedAt = nowIso();
-      console.log(`[proxy] listening on http://127.0.0.1:${_port}`);
-      resolve(status());
-    });
+    // Another process (watchdog, desktop app, an earlier CLI) may already own the
+    // port. Adopting it keeps `proxy start` idempotent instead of losing the bind
+    // race with EADDRINUSE, which used to leave callers thinking nothing started.
+    adoptRunningProxy(targetPort)
+      .then((live) => {
+        if (live) {
+          _port = live.port;
+          return resolve(live);
+        }
+        listen(targetPort, resolve, reject);
+      })
+      .catch(() => listen(targetPort, resolve, reject));
+  });
+}
+
+function adoptRunningProxy(targetPort: number): Promise<ProxyStatus | null> {
+  return fetchLiveStatus().then((live) => (live && live.running && live.port === targetPort ? live : null));
+}
+
+function listen(targetPort: number, resolve: (s: ProxyStatus) => void, reject: (e: Error) => void) {
+  rtk.set_filter_caps && rtk.set_filter_caps(loadConfig().caps || {});
+  // Output style is ALWAYS ON while the proxy runs (terse replies = fewer output
+  // tokens). Override with TOKENSAVER_OUTPUT_STYLE or proxy.json "output_style".
+  const style = setOutputStyle(undefined);
+  _styleLogged = false;
+  console.log(
+    style.style === 'off'
+      ? '[style] output style OFF — responses will be at full length'
+      : `[style] output style: ${style.label} (always on while the proxy runs · ~${tokens.count_tokens(style.prompt)} tokens/request · TOKENSAVER_OUTPUT_STYLE=off to disable)`
+  );
+  const proxify = ensureProxiedProviders(targetPort, true);
+  if (proxify.rewritten.length) {
+    console.log(`[proxy] routed through proxy: ${proxify.rewritten.join(', ')} (restart opencode if running)`);
+  }
+  const server = http.createServer(handleRequest);
+  server.on('error', (e) => {
+    _server = null;
+    reject(e);
+  });
+  // Initialize control API (REST + WS) on the same server
+  initControlApi(server, targetPort);
+  server.listen(targetPort, '127.0.0.1', () => {
+    _server = server;
+    _port = (server.address() as any).port as number;
+    _metrics.startedAt = nowIso();
+    console.log(`[proxy] listening on http://127.0.0.1:${_port}`);
+    resolve(status());
   });
 }
 
