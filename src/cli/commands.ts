@@ -6,6 +6,7 @@ import * as rtk from '../core/filters/rtk.js';
 import * as tokens from '../core/tokens.js';
 import * as budget from '../core/budget.js';
 import { readSpill, resolveSpillFile, cleanSpills, DEFAULT_SPILL_CONFIG, spillIdToPath } from '../core/spill.js';
+import * as setup from '../core/setup.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fmt } from '../tui/components.js';
@@ -15,6 +16,9 @@ const HELP = `${BANNER}${APP_NAME} CLI v${config.TS_VERSION} — reduce token wa
 
 USAGE
   token-saver [command] [args...]   run a subcommand (non-interactive)
+  token-saver setup [--port N] [--no-autostart]
+                                    one-command install for any PC: build + proxify + watchdog +
+                                    OS autostart (Startup/LaunchAgent/systemd). Re-runnable.
   token-saver [--tui|-i]            launch the interactive TUI (default when run without a command)
 
 COMMANDS
@@ -755,6 +759,23 @@ function cmdBudget(args: string[]): number {
   }
 }
 
+async function cmdSetup(args: string[]): Promise<number> {
+  const { flags, bools } = parseFlags(args);
+  const port = flags.port ? Number(flags.port) : undefined;
+  if (port !== undefined && (!Number.isInteger(port) || port < 1 || port > 65535)) {
+    outErr(`invalid --port ${flags.port}`);
+    return 1;
+  }
+  out(`${APP_NAME} v${config.TS_VERSION} — one-command setup`);
+  out(`Config: ${config.CONFIG_PATH}`);
+  out();
+  const lines = await setup.runSetup({ port, noAutostart: bools.has('no-autostart') });
+  for (const line of lines) out(`  ${line}`);
+  out();
+  out('Uninstall: token-saver proxy stop && token-saver proxy restore');
+  return 0;
+}
+
 function cmdDoctor(args: string[]): number {
   const { bools } = parseFlags(args);
   const fix = bools.has('fix');
@@ -836,6 +857,8 @@ export async function runCommand(argv: string[]): Promise<number> {
       return cmdBudget(rest);
     case 'limits':
       return cmdBudget(rest.length ? rest : ['status']);
+    case 'setup':
+      return cmdSetup(rest);
     case 'doctor':
       return cmdDoctor(rest);
     case 'recall':

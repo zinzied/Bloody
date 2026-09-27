@@ -1470,9 +1470,12 @@ export interface ProxifyResult {
   rewritten: string[];
 }
 
-export function ensureProxiedProviders(port?: number, rewriteConfig = false): ProxifyResult {
+export function ensureProxiedProviders(port?: number, rewriteConfig = false, exclude: string[] = []): ProxifyResult {
   const cfg = loadConfig();
   const targetPort = port !== undefined && port !== null ? port : cfg.port || DEFAULT_PORT;
+  // Upstreams that reject any non-OpenCode client cannot work through a proxy,
+  // so callers can name them to keep them pointed at their real baseURL.
+  const blocked = new Set(exclude.map((p) => normalizeProviderId(p)));
   // Each provider is pointed at its own path under the proxy root, so requests
   // arriving through it still say which provider they belong to.
   const proxyUrl = `http://127.0.0.1:${targetPort}`;
@@ -1492,6 +1495,25 @@ export function ensureProxiedProviders(port?: number, rewriteConfig = false): Pr
   const already: string[] = [];
   const skipped: string[] = [];
   for (const pid of [...set].sort()) {
+    if (blocked.has(normalizeProviderId(pid))) {
+      // A previous run may already have proxied it. Put it back on its real
+      // upstream, or a setup run would leave a provider that can only fail.
+      const real = cfg.saved_base_urls?.[pid] || cfg.upstreams?.[pid] || find_original_provider_base_url(pid, targetPort);
+      const listed = (cfg.proxied_providers || []).filter((p) => normalizeProviderId(p) !== normalizeProviderId(pid));
+      if (cfg.proxied_providers?.length !== listed.length) cfg.proxied_providers = listed;
+      if (real) {
+        cfg.saved_base_urls = cfg.saved_base_urls || {};
+        cfg.upstreams = cfg.upstreams || {};
+        cfg.saved_base_urls[pid] = real;
+        cfg.upstreams[pid] = real;
+        if (rewriteConfig) restore_provider_base_urls({ [pid]: real });
+      }
+      try {
+        saveConfig(cfg);
+      } catch {}
+      skipped.push(pid);
+      continue;
+    }
     if (cfg.saved_base_urls?.[pid] || cfg.upstreams?.[pid]) {
       already.push(pid);
       continue;
