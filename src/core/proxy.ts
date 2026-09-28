@@ -3,6 +3,7 @@ import https from 'node:https';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFile, execFileSync } from 'node:child_process';
 import { nowIso, readJson, writeJson, ensureDir, envValue } from './utils.js';
 import { PROXY_CONFIG, CACHE_PATH, SAVER_POLICY_PATH, read_config, read_merged_config, config_env_credential, find_original_provider_base_url, provider_id_key, provider_entry, get_current_model, set_provider_base_urls, restore_provider_base_urls } from './config.js';
 import { readCatalogCache, get_user_models_sync, model_total_cost } from './models.js';
@@ -13,7 +14,8 @@ import * as index from './index.js';
 import * as tokens from './tokens.js';
 import * as budget from './budget.js';
 import * as prompts from './prompts.js';
-import { initControlApi, emitEvent, EVENT_TOPICS, handleControlApi, fetchLiveStatus } from './control-api.js';
+import * as projectmap from './projectmap.js';
+import { initControlApi, emitEvent, EVENT_TOPICS, handleControlApi } from './control-api.js';
 import type { AppliedStyle, CompressStats, ProxyConfig, ProxyStatus, RequestBody } from './types.js';
 
 export const DEFAULT_PORT = 8199;
@@ -121,6 +123,9 @@ const _metrics: {
   hits: number;
   styleApplied: number;
   styleEscalated: number;
+  mapApplied: number;
+  mapRoot: string;
+  mapTokens: number;
   lastModel: string;
   lastAccount: string;
   startedAt: string | null;
@@ -130,6 +135,9 @@ const _metrics: {
   hits: 0,
   styleApplied: 0,
   styleEscalated: 0,
+  mapApplied: 0,
+  mapRoot: '',
+  mapTokens: 0,
   lastModel: '',
   lastAccount: '',
   startedAt: null,
@@ -211,6 +219,8 @@ function ensureSettingsLoaded(): void {
     if (wanted) _outputStyle = prompts.resolveOutputStyle(wanted);
   }
   loadStyleEscalation(cfg);
+  const mapWanted = envValue('PROJECT_MAP') || cfg.project_map;
+  if (mapWanted) _mapLevel = projectmap.resolveMapLevel(mapWanted);
 }
 
 /** Turn escalation on/off and optionally set the thresholds. Persisted by callers. */
@@ -293,6 +303,79 @@ function applyAlwaysOnStyle(pathOnly: string, body: RequestBody | null | undefin
   } catch {
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Project map: a locally generated orientation brief, injected once per session.
+//
+// Orienting on a large repo is pure overhead paid in tokens — a `ls`, a `tree`, a
+// README, a manifest, a few greps, repeated in every new session. None of it
+// needs a model, so projectmap.ts builds it from the filesystem for free and it
+// goes in as one system block. Clients resend the whole conversation each
+// request, so the marker check makes this a once-per-session cost rather than a
+// per-request one. Kill switch: NOBLEED_PROJECT_MAP=off
+// ---------------------------------------------------------------------------
+let _mapLevel: projectmap.MapLevel = projectmap.resolveMapLevel(envValue('PROJECT_MAP'));
+
+/** The active level. `undefined` re-reads the env var, then proxy.json. */
+export function projectMapLevel(value?: string | null): projectmap.MapLevel {
+  if (value === undefined || value === null || value === '') {
+    const wanted = envValue('PROJECT_MAP') || (loadConfig().project_map ?? null);
+    if (wanted) _mapLevel = projectmap.resolveMapLevel(wanted);
+  } else {
+    _mapLevel = projectmap.resolveMapLevel(value);
+  }
+  return _mapLevel;
+}
+
+/** Which project the map is built from, and what it would cost. */
+export function projectMapState(): projectmap.MapStatus {
+  ensureSettingsLoaded();
+  return projectmap.mapStatus({ level: _mapLevel, root: loadConfig().project_map_root || undefined });
+}
+
+/**
+ * Inject the map, at most once per session.
+ *
+ * Only chat-shaped requests qualify (an embeddings call has no system block and
+ * no business carrying a repo map), and a request that already carries the
+ * marker is left untouched — that is the whole token-saving mechanism.
+ *
+ * Returns the token cost of the injected block, or null when nothing was added.
+ */
+function applyProjectMapOnce(pathOnly: string, body: RequestBody | null | undefined): number | null {
+  if (!_mapLevel || _mapLevel === 'off') return null;
+  // The project map and the output style are both "always on" prompt injections.
+  // If the user killed the style, they want minimal prompt modification — the map
+  // follows the same switch.
+  if (_outputStyle.style === 'off') return null;
+  if (!body || !styleEligible(pathOnly, body)) return null;
+  if (projectmap.hasProjectMap(body)) return null;
+  try {
+    const root =
+      loadConfig().project_map_root ||
+      envValue('PROJECT_ROOT') ||
+      projectmap.rootFromPrompt(body) ||
+      undefined;
+    const map = projectmap.buildProjectMap({ root, level: _mapLevel });
+    if (!map) return null;
+    if (!projectmap.applyProjectMap(body as RequestBody, map)) return null;
+    _metrics.mapApplied += 1;
+    _metrics.mapRoot = map.root;
+    _metrics.mapTokens = map.tokens;
+    if (_metrics.mapApplied === 1) {
+      console.log(
+        `[map] project map ON: ${map.level} for ${map.root} — ${map.files} files, ${fmtInt(map.loc)} LOC, ~${map.tokens} tok (once per session)`
+      );
+    }
+    return map.tokens;
+  } catch {
+    return null;
+  }
+}
+
+function fmtInt(n: number): string {
+  return String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 }
 
 export const accountManager = new routing.AccountManager();
@@ -924,15 +1007,17 @@ function recordHistory(
   upstreamUrl: string,
   rawBody: string,
   outBody: string,
-  style: AppliedStyle | null = null
+  style: AppliedStyle | null = null,
+  mapTokens = 0
 ): RequestUsage | null {
   try {
     const cfg = loadConfig();
     const { rawTokens, outTokens } = computeTokenSavings(rawBody, outBody);
-    // The always-on output style adds a small prompt to every request. Keep that
-    // cost out of the compression savings (reported on its own) so `saved_tokens`
-    // keeps meaning "tokens saved by compressing your request".
-    const styleTokens = style ? style.tokens : 0;
+    // The always-on output style and the project map each add a small prompt to
+    // every request. Keep that cost out of the compression savings (reported on
+    // its own) so `saved_tokens` keeps meaning "tokens saved by compressing your
+    // request".
+    const styleTokens = (style ? style.tokens : 0) + mapTokens;
     const savedTokens = Math.max(0, rawTokens - Math.max(0, outTokens - styleTokens));
     const saved = stats ? Math.max(0, stats.bytesBefore - stats.bytesAfter) : 0;
     const history = cfg.history || [];
@@ -989,7 +1074,8 @@ function forward(
   credentialKey: string,
   upstreamProvider: string,
   style: AppliedStyle | null = null,
-  clientKeyUsable = true
+  clientKeyUsable = true,
+  mapTokens = 0
 ): void {
   const u = new URL(upstreamUrl);
   const transport = u.protocol === 'https:' ? https : http;
@@ -1104,7 +1190,7 @@ function forward(
             { method: 'POST', headers: { ...pick(), 'Content-Length': String(Buffer.byteLength(rawBody)) } },
             (res2) => {
               streamBack(res2, res);
-              const usage = recordHistory(pathOnly, modelId, stats, upstreamUrl, rawBody, outBody, null);
+              const usage = recordHistory(pathOnly, modelId, stats, upstreamUrl, rawBody, outBody, null, mapTokens);
               finish(res2.statusCode || 0, res2, usage);
             }
           );
@@ -1120,7 +1206,7 @@ function forward(
           return;
         }
         streamBack(upRes, res);
-        const usage = recordHistory(pathOnly, modelId, stats, upstreamUrl, rawBody, outBody, style);
+        const usage = recordHistory(pathOnly, modelId, stats, upstreamUrl, rawBody, outBody, style, mapTokens);
         finish(upRes.statusCode || 0, upRes, usage);
       }
     );
@@ -1358,9 +1444,14 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       if (appliedStyle.escalated) _metrics.styleEscalated += 1;
     }
 
+    // Project map: a free orientation brief, injected the first time a session
+    // talks to the proxy and then carried by the conversation itself. The
+    // marker check inside makes every later request of that session a no-op.
+    const mapTokens = applyProjectMapOnce(pathOnly, data);
+
     let outBody = raw;
     let stats: CompressStats | null = null;
-    const forceRewrite = budgetEnforced || !!rateLimitReroutedFrom || !!appliedStyle;
+    const forceRewrite = budgetEnforced || !!rateLimitReroutedFrom || !!appliedStyle || mapTokens !== null;
     if (data) {
       const compressed = rtk.compress_messages(data, true);
       if (compressed) {
@@ -1380,7 +1471,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       }
     }
 
-    forward(req, res, upstreamUrl, outBody, raw, pathOnly, modelId, stats, account, credentialKey, resolved.pid, appliedStyle, !rerouted);
+    forward(req, res, upstreamUrl, outBody, raw, pathOnly, modelId, stats, account, credentialKey, resolved.pid, appliedStyle, !rerouted, mapTokens ?? 0);
   });
 }
 
@@ -1407,6 +1498,10 @@ export function status(): ProxyStatus {
     outputStyleApplied: _metrics.styleApplied,
     outputStyleEscalate: _styleEscalate,
     outputStyleEscalated: _metrics.styleEscalated,
+    projectMap: _mapLevel,
+    projectMapApplied: _metrics.mapApplied,
+    projectMapRoot: _metrics.mapRoot,
+    projectMapTokens: _metrics.mapTokens,
   };
 }
 
@@ -1589,22 +1684,60 @@ export function start(port?: number): Promise<ProxyStatus> {
     if (envValue('RATELIMIT_FALLBACK') === undefined) process.env.NOBLEED_RATELIMIT_FALLBACK = '1';
     const targetPort = port !== undefined && port !== null ? port : loadConfig().port || DEFAULT_PORT;
     // Another process (watchdog, desktop app, an earlier CLI) may already own the
-    // port. Adopting it keeps `proxy start` idempotent instead of losing the bind
-    // race with EADDRINUSE, which used to leave callers thinking nothing started.
-    adoptRunningProxy(targetPort)
-      .then((live) => {
-        if (live) {
-          _port = live.port;
-          return resolve(live);
-        }
-        listen(targetPort, resolve, reject);
-      })
+    // port. Kill it and start fresh, so `proxy start` always gives a live server
+    // instead of adopting a stale one (or losing the bind with EADDRINUSE).
+    killProcessOnPort(targetPort)
+      .then(() => listen(targetPort, resolve, reject))
       .catch(() => listen(targetPort, resolve, reject));
   });
 }
 
-function adoptRunningProxy(targetPort: number): Promise<ProxyStatus | null> {
-  return fetchLiveStatus().then((live) => (live && live.running && live.port === targetPort ? live : null));
+/** PIDs of processes listening on `port` (netstat on Windows, lsof elsewhere). */
+function pidsOnPort(port: number): Promise<number[]> {
+  return new Promise((resolve) => {
+    const isWin = process.platform === 'win32';
+    const cmd = isWin ? { file: 'netstat', args: ['-ano', '-p', 'tcp'] } : { file: 'lsof', args: ['-ti', `tcp:${port}`] };
+    execFile(cmd.file, cmd.args, { windowsHide: true }, (err, stdout) => {
+      const pids = new Set<number>();
+      if (!err && stdout) {
+        if (isWin) {
+          for (const line of stdout.split(/\r?\n/)) {
+            const m = /:(\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$/.exec(line.trim());
+            if (m && Number(m[1]) === port) pids.add(Number(m[2]));
+          }
+        } else {
+          for (const tok of stdout.split(/\s+/)) {
+            const n = Number(tok);
+            if (Number.isInteger(n) && n > 0) pids.add(n);
+          }
+        }
+      }
+      resolve([...pids]);
+    });
+  });
+}
+
+/** Terminate whatever process owns `port` so a fresh proxy can bind it. */
+async function killProcessOnPort(port: number): Promise<void> {
+  const pids = await pidsOnPort(port);
+  if (!pids.length) return;
+  console.log(`[proxy] port ${port} in use — stopping old server (pid ${pids.join(', ')})`);
+  for (const pid of pids) {
+    if (pid === process.pid) continue;
+    try {
+      if (process.platform === 'win32') {
+        execFileSync('taskkill', ['/PID', String(pid), '/F'], { windowsHide: true, stdio: 'ignore' });
+      } else {
+        process.kill(pid, 'SIGKILL');
+      }
+    } catch {}
+  }
+  // Wait for the port to actually free before binding.
+  for (let i = 0; i < 50; i++) {
+    const remaining = await pidsOnPort(port);
+    if (!remaining.length) return;
+    await new Promise((r) => setTimeout(r, 100));
+  }
 }
 
 function listen(targetPort: number, resolve: (s: ProxyStatus) => void, reject: (e: Error) => void) {

@@ -346,7 +346,7 @@ export function outputStyleMarker(setting: OutputStyleSetting): string {
 }
 
 /** Every string the model sees as instructions, across all supported formats. */
-function _systemStrings(body: RequestBody): string[] {
+export function system_strings(body: RequestBody): string[] {
   const out: string[] = [];
   if (!body || typeof body !== 'object') return out;
 
@@ -396,7 +396,7 @@ function _systemStrings(body: RequestBody): string[] {
 export function has_output_style(body: RequestBody, setting: OutputStyleSetting): boolean {
   const marker = outputStyleMarker(setting);
   if (!marker) return false;
-  return _systemStrings(body).some((text) => text.includes(marker));
+  return system_strings(body).some((text) => text.includes(marker));
 }
 
 /**
@@ -411,7 +411,7 @@ export function has_any_output_style(body: RequestBody, setting: OutputStyleSett
   if (!setting || setting.style === 'off') return false;
   const table = setting.style === 'ponytail' ? PONYTAIL_PROMPTS : CAVEMAN_PROMPTS;
   const family = Object.values(table).map((p) => _uniquePrefix(p, Object.values(table)));
-  const strings = _systemStrings(body);
+  const strings = system_strings(body);
   return family.some((marker) => marker && strings.some((text) => text.includes(marker)));
 }
 

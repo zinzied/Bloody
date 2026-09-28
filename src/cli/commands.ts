@@ -5,6 +5,7 @@ import * as proxy from '../core/proxy.js';
 import * as rtk from '../core/filters/rtk.js';
 import * as tokens from '../core/tokens.js';
 import * as budget from '../core/budget.js';
+import * as projectmap from '../core/projectmap.js';
 import { readSpill, resolveSpillFile, cleanSpills, DEFAULT_SPILL_CONFIG, spillIdToPath } from '../core/spill.js';
 import * as setup from '../core/setup.js';
 import fs from 'node:fs';
@@ -69,7 +70,13 @@ proxy restore                     restore direct provider URLs (use if the proxy
   recall <id|path> [--head N]        print a spilled tool output in full (proxy spills >16KB to ~/.config/opencode/spill)
   recall --list [--max N]            list recent spill files (default 20)
   recall --clean [--older-than H]    delete spill files older than N hours (default 24h)
-`;
+  map                                project map status (free orientation brief, injected once per session)
+  map build [dir] [--level L] [--pin]
+                                     build the map now; --pin saves dir as the default project
+  map show [dir]                     print the full map text
+  map on [level] | off | level <l>   set the level: lite | standard (default) | full | off
+  map clear                          delete cached map files
+  `;
 
 function out(line = ''): void {
   console.log(line);
@@ -760,6 +767,90 @@ function cmdBudget(args: string[]): number {
   }
 }
 
+function cmdMap(args: string[]): number {
+  const { positionals, flags, bools } = parseFlags(args);
+  const sub = positionals[0] || 'status';
+
+  if (sub === 'clear') {
+    const n = projectmap.clearMapFiles();
+    out(`Deleted ${n} cached map file(s).`);
+    return 0;
+  }
+
+  if (sub === 'show') {
+    const dir = positionals[1];
+    const level = projectmap.resolveMapLevel(flags.level);
+    const m = projectmap.buildProjectMap({ root: dir || undefined, level, force: true });
+    if (!m) {
+      outErr('No project found at that path.');
+      return 1;
+    }
+    out(m.text);
+    return 0;
+  }
+
+  if (sub === 'build') {
+    const dir = positionals[1];
+    const level = projectmap.resolveMapLevel(flags.level);
+    const m = projectmap.buildProjectMap({ root: dir || undefined, level, force: true });
+    if (!m) {
+      outErr('No project found at that path.');
+      return 1;
+    }
+    if (bools.has('pin') || flags.pin) {
+      const cfg = proxy.loadConfig();
+      proxy.saveConfig({ ...cfg, project_map_root: m.root });
+      out(`Pinned project root: ${m.root}`);
+    }
+    out(`Built ${m.level} map for ${m.root}`);
+    out(`  ${m.files} files, ${fmt(m.loc)} LOC, ${m.bytes} bytes, ~${m.tokens} tokens`);
+    out(`  build ${m.buildMs}ms${m.truncated ? ' (truncated to fit budget)' : ''}`);
+    out(`  cache: ${m.file}`);
+    out();
+    out(m.text);
+    return 0;
+  }
+
+  if (sub === 'on' || sub === 'off' || sub === 'level') {
+    let level: projectmap.MapLevel;
+    if (sub === 'off') {
+      level = 'off';
+    } else if (sub === 'on') {
+      level = projectmap.resolveMapLevel(positionals[1] || flags.level);
+    } else {
+      level = projectmap.resolveMapLevel(positionals[1] || flags.level);
+    }
+    const cfg = proxy.loadConfig();
+    proxy.saveConfig({ ...cfg, project_map: level });
+    proxy.projectMapLevel(level);
+    if (level === 'off') {
+      out('Project map off — no orientation brief will be injected.');
+    } else {
+      out(`Project map: ${level}`);
+      out('Injected once per session into the system prompt while the proxy runs.');
+    }
+    out(`Levels: ${projectmap.mapLevelCycle().join(' | ')}`);
+    return 0;
+  }
+
+  // status (default)
+  const level = proxy.projectMapLevel();
+  const st = projectmap.mapStatus({ level });
+  out(`Project map : ${level}`);
+  out(`Project root : ${st.root}`);
+  if (st.built) {
+    out(`Built       : ${st.files} files, ${fmt(st.loc)} LOC, ${st.bytes} bytes, ~${st.tokens} tokens`);
+    out(`Build time  : ${st.buildMs}ms${st.truncated ? ' (truncated)' : ''}`);
+    out(`Cache       : ${st.file}`);
+  } else {
+    out('Built       : not yet — run "nobleed map build" to pre-warm the cache');
+  }
+  out(`Levels      : ${st.levels.join(' | ')}`);
+  out('Injected once per session into the system prompt while the proxy runs.');
+  out('Set NOBLEED_PROJECT_ROOT or run "nobleed map build --pin <dir>" to pin the project.');
+  return 0;
+}
+
 async function cmdSetup(args: string[]): Promise<number> {
   const { flags, bools } = parseFlags(args);
   const port = flags.port ? Number(flags.port) : undefined;
@@ -864,6 +955,8 @@ export async function runCommand(argv: string[]): Promise<number> {
       return cmdDoctor(rest);
     case 'recall':
       return cmdRecall(rest);
+    case 'map':
+      return cmdMap(rest);
     default:
       outErr(`Unknown command: ${cmd}`);
       outErr(`Run "nobleed help" for usage.`);

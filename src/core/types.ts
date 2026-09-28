@@ -109,6 +109,12 @@ export interface ProxyConfig {
   output_style_escalate?: boolean;
   /** Context sizes (in tokens) at which the level steps up. Default [20000, 60000]. */
   output_style_escalate_at?: number[];
+  /** Project map injected once per session so the agent does not spend tokens
+   *  rediscovering the repo: 'lite' | 'standard' (default) | 'full' | 'off'. */
+  project_map?: string;
+  /** Pin the project the map is built from. Otherwise it is taken from
+   *  NOBLEED_PROJECT_ROOT, the agent's system prompt, or the cwd. */
+  project_map_root?: string;
 }
 
 /** What the proxy actually injected for one request. */
@@ -156,6 +162,14 @@ export interface ProxyStatus {
   outputStyleEscalate?: boolean;
   /** Requests that used a level above the configured one. */
   outputStyleEscalated?: number;
+  /** Active project-map level ('off' when disabled). */
+  projectMap?: string;
+  /** Requests a project map was injected into (once per session by design). */
+  projectMapApplied?: number;
+  /** Project the map is built from, when one was resolved. */
+  projectMapRoot?: string;
+  /** Token cost of the most recent map. */
+  projectMapTokens?: number;
 }
 
 export interface SqliteRow {
