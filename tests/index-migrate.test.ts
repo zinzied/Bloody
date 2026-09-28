@@ -1,15 +1,35 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { createRequire } from 'node:module';
 import { test } from 'node:test';
 import assert from 'node:assert';
-import Database from 'better-sqlite3';
+import type { SqliteDb } from '../src/core/types.js';
+
+const require = createRequire(import.meta.url);
+
+// better-sqlite3 is an optional dependency — it needs a native build on some
+// machines, and the ledger falls back to the built-in node:sqlite — so the test
+// has to be able to write the legacy file with whichever driver is present,
+// using the same two attempts as src/core/index.ts.
+function open(file: string): SqliteDb {
+  const attempts: Array<() => SqliteDb> = [
+    () => new (require('better-sqlite3') as new (p: string) => SqliteDb)(file),
+    () => new (require('node:sqlite').DatabaseSync as new (p: string) => SqliteDb)(file),
+  ];
+  for (const attempt of attempts) {
+    try {
+      return attempt();
+    } catch {}
+  }
+  throw new Error('no sqlite driver available — install better-sqlite3 or use Node.js 22.13+ for node:sqlite');
+}
 
 // The ledger is opened lazily and cached for the life of the process, so a
 // migration can only be exercised from a file that already exists on disk before
 // the module is imported. Hence a separate test file with its own home.
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-index-migrate-'));
-process.env.TOKENSAVER_HOME = TMP;
+process.env.NOBLEED_HOME = TMP;
 
 const DB_DIR = path.join(TMP, '.config', 'opencode', 'compress');
 const DB_FILE = path.join(DB_DIR, 'index.db');
@@ -20,7 +40,7 @@ fs.mkdirSync(DB_DIR, { recursive: true });
 // fails with "no column named cost_level" — silently, because the failure was
 // swallowed and the caller discarded the result.
 {
-  const db = new Database(DB_FILE);
+  const db = open(DB_FILE);
   db.exec(`
     CREATE TABLE proxy_requests (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,8 +72,8 @@ test('an index.db from an older build is topped up instead of failing every inse
   assert.strictEqual(stats!.total_requests, 2, 'the legacy row plus the new one');
   assert.strictEqual(stats!.total_saved, 340, '90 + 250');
 
-  const db = new Database(DB_FILE);
-  const cols = db.prepare('PRAGMA table_info(proxy_requests)').all().map((r: any) => r.name);
+  const db = open(DB_FILE);
+  const cols = db.prepare('PRAGMA table_info(proxy_requests)').all().map((r) => r.name);
   db.close();
   assert.ok(cols.includes('cost_level'), `cost_level should have been added, got ${cols.join(',')}`);
   assert.ok(cols.includes('id'), 'the original columns are left alone');

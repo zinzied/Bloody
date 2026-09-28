@@ -35,7 +35,7 @@ export interface SidebarProps {
  *   items={NAV}
  *   activeId={active}
  *   onNavigate={setActive}
- *   brand="Bloody"
+ *   brand="NoBleed"
  *   version="10.0.0"
  * />
  */

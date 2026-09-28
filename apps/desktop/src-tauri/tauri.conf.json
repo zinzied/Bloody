@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Bloody",
+  "productName": "NoBleed",
   "version": "10.0.0",
-  "identifier": "com.bloody.tokensaver",
+  "identifier": "com.nobleed.desktop",
   "build": {
     "beforeDevCommand": "npm --prefix ../../.. run build",
     "devUrl": "http://localhost:5173",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Bloody Token Saver",
+        "title": "NoBleed",
         "width": 1200,
         "height": 800,
         "minWidth": 900,

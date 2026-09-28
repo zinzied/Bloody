@@ -27,7 +27,7 @@ async function main() {
   const interactive = process.stdin.isTTY === true && process.stdout.isTTY === true;
   if (wantsTui || (!command.length && interactive)) {
     if (!interactive) {
-      console.log(`${APP_NAME} CLI v${TS_VERSION} — the TUI needs an interactive terminal. Run "token-saver help" for CLI commands.`);
+      console.log(`${APP_NAME} CLI v${TS_VERSION} — the TUI needs an interactive terminal. Run "nobleed help" for CLI commands.`);
       return;
     }
     // Auto-clear expired rate limits and auto-start proxy if enabled
@@ -45,7 +45,7 @@ async function main() {
     return;
   }
   if (!command.length && isPiped) {
-    console.log(`${APP_NAME} CLI v${TS_VERSION} — pipe a subcommand (see "token-saver help").`);
+    console.log(`${APP_NAME} CLI v${TS_VERSION} — pipe a subcommand (see "nobleed help").`);
     return;
   }
   const code = await runCommand(command);

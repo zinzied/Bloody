@@ -1,6 +1,7 @@
 // Control API + WebSocket event bus for the desktop app.
 // Mounted at /api/* on the existing proxy http.Server (strictly 127.0.0.1).
-// Token auth via X-Token-Saver header. File-based handshake via control.json.
+// Token auth via the X-NoBleed header (the legacy X-Token-Saver is still
+// accepted). File-based handshake via control.json.
 
 import http from 'node:http';
 import { WebSocketServer } from 'ws';
@@ -46,7 +47,9 @@ export function setControlToken(token: string, port: number) {
 
 function checkAuth(headers: http.IncomingHttpHeaders): boolean {
   if (!controlToken) return false;
-  const sent = headers['x-token-saver'] as string | undefined;
+  // The header was named after the old project; both spellings are read so a
+  // desktop build or script from before the rename keeps working.
+  const sent = (headers['x-nobleed'] ?? headers['x-token-saver']) as string | undefined;
   return sent === controlToken;
 }
 
@@ -290,7 +293,7 @@ export async function handleControlApi(
 
   // Check token auth for all /api/*
   if (!checkAuth(req.headers)) {
-    sendJson(res, 401, { error: 'unauthorized: missing or invalid X-Token-Saver header' });
+    sendJson(res, 401, { error: 'unauthorized: missing or invalid X-NoBleed header' });
     return true;
   }
 
@@ -335,7 +338,7 @@ function initWebSocket(server: http.Server) {
     // Token auth on WS handshake
     const proto = req.headers['sec-websocket-protocol'] as string | undefined;
     const tokenFromProto = proto?.split(',').map(s => s.trim()).find(s => s.startsWith('token='))?.slice(6);
-    const tokenFromHeader = req.headers['x-token-saver'] as string | undefined;
+    const tokenFromHeader = (req.headers['x-nobleed'] ?? req.headers['x-token-saver']) as string | undefined;
     const token = tokenFromProto || tokenFromHeader;
 
     if (token !== controlToken) {
@@ -389,7 +392,7 @@ export async function fetchLiveStatus(): Promise<ProxyStatus | null> {
       resolve(v);
     };
     const req = http.request(
-      { host: '127.0.0.1', port, path: '/api/status', method: 'GET', headers: { 'X-Token-Saver': token } },
+      { host: '127.0.0.1', port, path: '/api/status', method: 'GET', headers: { 'X-NoBleed': token } },
       (res) => {
         if (res.statusCode !== 200) {
           res.resume();

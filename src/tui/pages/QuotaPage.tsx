@@ -62,7 +62,7 @@ export function QuotaPage() {
             </Section>
           )}
           {limitReached && decision === 'blocked' && (
-            <Hint>Blocked by your choice — press `r` after re-opening this page or run `token-saver budget reset` to switch back.</Hint>
+            <Hint>Blocked by your choice — press `r` after re-opening this page or run `nobleed budget reset` to switch back.</Hint>
           )}
           {/* Daily budget guard (user-controlled) */}
           {budgetStatus ? (

@@ -105,7 +105,7 @@ export interface ProxyConfig {
    *  'caveman-lite' (default), 'caveman-full|ultra|wenyan*', 'ponytail-*', 'off'. */
   output_style?: string;
   /** Step the style up as the request's own context grows (default true).
-   *  Set false (or TOKENSAVER_OUTPUT_STYLE_ESCALATE=off) to pin the level. */
+   *  Set false (or NOBLEED_OUTPUT_STYLE_ESCALATE=off) to pin the level. */
   output_style_escalate?: boolean;
   /** Context sizes (in tokens) at which the level steps up. Default [20000, 60000]. */
   output_style_escalate_at?: number[];

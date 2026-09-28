@@ -1,4 +1,4 @@
-// Design System Tokens - Semantic design tokens for the Bloody desktop app
+// Design System Tokens - Semantic design tokens for the NoBleed desktop app
 // Extends the TUI theme (src/tui/theme.ts) with full desktop token set
 // All values are immutable constants for build-time CSS variable generation
 

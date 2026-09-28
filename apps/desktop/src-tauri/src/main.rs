@@ -66,7 +66,7 @@ fn build_tray() -> SystemTray {
         .add_item(SystemTrayMenuItem::new("reset_budget", "Reset Daily Budget"))
         .add_native_item(tauri::SystemTrayMenuItem::Separator)
         .add_item(SystemTrayMenuItem::new("quit", "Quit"));
-    SystemTray::new().with_menu(menu).with_tooltip("Bloody Token Saver")
+    SystemTray::new().with_menu(menu).with_tooltip("NoBleed")
 }
 
 fn handle_tray_event(app: &AppHandle, event: SystemTrayEvent) {
@@ -125,13 +125,13 @@ async fn start_engine_and_ws(app: AppHandle) {
         *state.engine_child.lock().unwrap() = Some(child);
     }
 
-    // Read stdout for TOKENSAVER_CONTROL_STARTED <port>
+    // Read stdout for NOBLEED_CONTROL_STARTED <port>
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
     let mut port = None;
 
     while let Ok(Some(line)) = lines.next_line().await {
-        if line.starts_with("TOKENSAVER_CONTROL_STARTED ") {
+        if line.starts_with("NOBLEED_CONTROL_STARTED ") {
             port = line.split_whitespace().nth(1).and_then(|s| s.parse().ok());
             break;
         }
@@ -276,12 +276,12 @@ fn handle_ws_frame(app: &AppHandle, frame: WsFrame) {
 
 fn update_tray_tooltip(app: &AppHandle, status: &str) {
     let tooltip = match status {
-        "connected" => "Bloody Token Saver — Connected",
-        "budget_exceeded" => "Bloody Token Saver — Budget Exceeded!",
-        "limit_reached" => "Bloody Token Saver — Daily Limit Reached (Reset or stay blocked)",
-        "ratelimited" => "Bloody Token Saver — Provider Rate Limited",
-        "stopped" => "Bloody Token Saver — Stopped",
-        _ => "Bloody Token Saver",
+        "connected" => "NoBleed — Connected",
+        "budget_exceeded" => "NoBleed — Budget Exceeded!",
+        "limit_reached" => "NoBleed — Daily Limit Reached (Reset or stay blocked)",
+        "ratelimited" => "NoBleed — Provider Rate Limited",
+        "stopped" => "NoBleed — Stopped",
+        _ => "NoBleed",
     };
     if let Some(tray) = app.tray_by_id("main") {
         let _ = tray.set_tooltip(Some(tooltip));

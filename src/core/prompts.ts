@@ -257,7 +257,7 @@ export function inject_ponytail(body: RequestBody, level = 'lite'): void {
 // ---------------------------------------------------------------------------
 // Output style (terse-output prompt) — applied by the proxy to every chat
 // request while it runs. Output tokens cost 3-8x input tokens, so this is the
-// highest-leverage saving available. Kill switch: TOKENSAVER_OUTPUT_STYLE=off
+// highest-leverage saving available. Kill switch: NOBLEED_OUTPUT_STYLE=off
 // ---------------------------------------------------------------------------
 export const DEFAULT_OUTPUT_STYLE = 'caveman-lite';
 

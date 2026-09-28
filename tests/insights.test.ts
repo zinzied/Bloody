@@ -6,7 +6,7 @@ import assert from 'node:assert';
 import { DatabaseSync } from 'node:sqlite';
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-insights-'));
-process.env.TOKENSAVER_HOME = TMP;
+process.env.NOBLEED_HOME = TMP;
 
 const base = path.join(TMP, '.config', 'opencode');
 const comp = path.join(base, 'compress');

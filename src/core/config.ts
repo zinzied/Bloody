@@ -1,12 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { sha256Hex, md5Hex, nowIso, ensureDir, readJson, writeJson } from './utils.js';
+import { sha256Hex, md5Hex, nowIso, ensureDir, readJson, writeJson, envValue } from './utils.js';
 export { ensureDir } from './utils.js';
 
 export const TS_VERSION = '10.0.0';
 
-const BASE_HOME = process.env.TOKENSAVER_HOME || os.homedir();
+const BASE_HOME = envValue('HOME') || os.homedir();
 
 export const CONFIG_PATH = path.join(BASE_HOME, '.config', 'opencode', 'opencode.jsonc');
 /**

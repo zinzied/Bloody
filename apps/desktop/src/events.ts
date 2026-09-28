@@ -1,4 +1,4 @@
-// WebSocket event subscriber for live updates from the Bloody engine
+// WebSocket event subscriber for live updates from the NoBleed engine
 
 type WsFrame = {
   topic: string;

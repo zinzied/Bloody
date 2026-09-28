@@ -1,29 +1,42 @@
 {
-  "name": "token-saver-cli",
+  "name": "nobleed",
   "version": "10.0.0",
-  "description": "Token Saver v10 — reduce token waste and spending when using AI coding models (TypeScript + Ink TUI)",
+  "description": "NoBleed v10 — stop the token bleed: reduce token waste and spending when using AI coding models (TypeScript + Ink TUI)",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
+    "nobleed": "dist/index.js",
     "token-saver": "dist/index.js"
   },
   "license": "MIT",
   "workspaces": ["apps/*"],
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "scripts": {
+    "deps": "node scripts/ensure-deps.mjs",
+    "prestart": "node scripts/ensure-deps.mjs",
     "start": "tsx src/index.tsx",
+    "predev": "node scripts/ensure-deps.mjs",
     "dev": "tsx src/index.tsx",
+    "prebuild": "node scripts/ensure-deps.mjs",
     "build": "tsc -p tsconfig.build.json",
+    "pretypecheck": "node scripts/ensure-deps.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --import tsx --test tests/*.test.ts",
+    "pretest": "node scripts/ensure-deps.mjs",
+    "test": "node --import tsx --test --test-force-exit tests/*.test.ts",
     "check:encoding": "node scripts/check-encoding.mjs",
-    "verify": "npm run check:encoding && npm run typecheck && npm test"
+    "verify": "npm run check:encoding && npm run typecheck && npm test",
+    "sqlite:native": "npm install better-sqlite3 --no-audit --no-fund"
   },
   "dependencies": {
-    "better-sqlite3": "^13.0.3",
     "ink": "^7.1.1",
     "ink-text-input": "^6.0.0",
     "js-tiktoken": "^1.0.21",
     "react": "^19.2.0"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "^13.0.3"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",

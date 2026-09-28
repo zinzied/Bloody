@@ -1,7 +1,7 @@
 [package]
-name = "bloody-desktop"
+name = "nobleed-desktop"
 version = "10.0.0"
-description = "Bloody token saver desktop app"
+description = "NoBleed desktop app"
 edition = "2021"
 
 [build-dependencies]

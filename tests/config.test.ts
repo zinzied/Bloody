@@ -5,7 +5,7 @@ import path from 'node:path';
 import os from 'node:os';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-config-'));
-process.env.TOKENSAVER_HOME = tmp;
+process.env.NOBLEED_HOME = tmp;
 
 const config = await import('../src/core/config.js');
 

@@ -6,7 +6,7 @@ import os from 'node:os';
 import http from 'node:http';
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-insights-'));
-process.env.TOKENSAVER_HOME = TMP;
+process.env.NOBLEED_HOME = TMP;
 
 const proxy = await import('../src/core/proxy.js');
 
@@ -62,21 +62,33 @@ function rawHeaderLines(req: http.IncomingMessage): string[] {
 
 /**
  * Point the auth-file lookups at a throwaway home so one test's auth.json cannot
- * influence the others. config.ts binds its own paths at import time, but the
- * proxy resolves the auth locations per call.
+ * influence the others, and hide the provider credentials the machine exports.
+ * `ANTHROPIC_AUTH_TOKEN` and friends are common on the very PCs this tool is for
+ * (an agent routed through a gateway), and the proxy is right to read them — but
+ * inside these tests an exported key would be the credential under assertion, so
+ * the runs would only pass on a machine with no credentials configured.
+ * config.ts binds its own paths at import time, but the proxy resolves the auth
+ * locations per call.
  */
 async function withIsolatedAuthHome<T>(auth: Record<string, any>, fn: () => Promise<T>): Promise<T> {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-auth-'));
   const dir = path.join(home, '.local', 'share', 'opencode');
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'auth.json'), JSON.stringify(auth), 'utf-8');
-  const previous = process.env.TOKENSAVER_HOME;
-  process.env.TOKENSAVER_HOME = home;
+  const previous = process.env.NOBLEED_HOME;
+  process.env.NOBLEED_HOME = home;
+  const hidden: Array<[string, string]> = [];
+  for (const key of Object.keys(process.env)) {
+    if (!/(API_KEY|API_TOKEN|ACCESS_TOKEN|AUTH_TOKEN|API_BASE|_TOKEN)$/.test(key)) continue;
+    hidden.push([key, process.env[key] as string]);
+    delete process.env[key];
+  }
   try {
     return await fn();
   } finally {
-    if (previous === undefined) delete process.env.TOKENSAVER_HOME;
-    else process.env.TOKENSAVER_HOME = previous;
+    for (const [key, value] of hidden) process.env[key] = value;
+    if (previous === undefined) delete process.env.NOBLEED_HOME;
+    else process.env.NOBLEED_HOME = previous;
   }
 }
 
@@ -565,10 +577,14 @@ test('the control token is never forwarded to the upstream provider', async () =
   try {
     const s = await post(proxy.status().port!, '/v1/chat/completions', body, {
       Authorization: 'Bearer client-key',
+      'X-NoBleed': 'secret-control-token',
       'X-Token-Saver': 'secret-control-token',
     });
     assert.strictEqual(s.status, 200);
-    assert.ok(!seen.some((l) => /x-token-saver/i.test(l)), `control token leaked upstream: ${seen.join(' | ')}`);
+    assert.ok(
+      !seen.some((l) => /x-(nobleed|token-saver)/i.test(l)),
+      `control token leaked upstream: ${seen.join(' | ')}`
+    );
     assert.ok(seen.some((l) => /^authorization: Bearer client-key$/i.test(l)), 'the client credential still passes through');
   } finally {
     await proxy.stop();

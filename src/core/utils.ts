@@ -77,3 +77,15 @@ export function round1(n: number): number {
 export function clamp(n: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, n));
 }
+
+/**
+ * Read one of this app's own environment variables.
+ *
+ * NOBLEED_ is the current spelling. TOKENSAVER_ is still honoured so shells,
+ * Startup shortcuts, LaunchAgents and systemd units written before the rename
+ * keep working — NOBLEED_ wins when both are set.
+ */
+export function envValue(name: string): string | undefined {
+  return process.env[`NOBLEED_${name}`] ?? process.env[`TOKENSAVER_${name}`];
+}
+

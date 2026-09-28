@@ -67,7 +67,7 @@ export function App() {
             <span>Starting engine on port {enginePort ?? '…'}</span>
           </div>
           <p className="hint" style={{ marginTop: '16px' }}>
-            The Bloody token-saver proxy is starting up…
+            The NoBleed proxy is starting up…
           </p>
         </div>
       </div>
@@ -78,7 +78,7 @@ export function App() {
     <div className="app-shell">
       <aside className="sidebar" role="navigation" aria-label="Main navigation">
         <div className="sidebar-brand">
-          <span className="sidebar-title">Bloody</span>
+          <span className="sidebar-title">NoBleed</span>
           <span className="sidebar-version">v10.0.0</span>
         </div>
         <nav>

@@ -1,4 +1,4 @@
-// API client for the Bloody control plane (REST + WS)
+// API client for the NoBleed control plane (REST + WS)
 // All calls go to http://127.0.0.1:<port>/api/*
 
 let cachedPort: number | null = null;
@@ -20,7 +20,9 @@ function getBaseUrl(): string {
 
 function authHeaders(): Record<string, string> {
   if (!cachedToken) throw new Error('Control token not set');
-  return { 'X-Token-Saver': cachedToken, 'Content-Type': 'application/json' };
+  // X-NoBleed is the current spelling; the engine still accepts the legacy
+  // X-Token-Saver header, so an older engine works with this build too.
+  return { 'X-NoBleed': cachedToken, 'Content-Type': 'application/json' };
 }
 
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {

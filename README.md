@@ -1,8 +1,10 @@
-# █BLOODY 
+# NoBleed
 
 <img width="1906" height="590" alt="image" src="https://github.com/user-attachments/assets/955beff9-0985-4612-8d54-9830623857a5" />
 
-Reduce token waste and spending when using AI coding models. Compare pricing across **all providers**, compress requests and tool output, route through a local proxy, and track savings — all from a reactive TUI or the command line.
+Stop the token bleed: reduce token waste and spending when using AI coding models. Compare pricing across **all providers**, compress requests and tool output, route through a local proxy, and track savings — all from a reactive TUI or the command line.
+
+> **Renamed from *Bloody Token Saver* to *NoBleed*.** The CLI installs as `nobleed`, and the old `token-saver` name keeps working as an alias. `NOBLEED_*` is the current environment-variable spelling; `TOKENSAVER_*` is still read for setups written before the rename (the new name wins when both are set).
 
 **Inspired by [lean-ctx](https://github.com/yvgude/lean-ctx)** and [ctxrs/ctx](https://github.com/ctxrs/ctx) — context engineering + agent history search. Advanced features (RTK compression, caveman mode, format translation, quota tracking, multi-account routing) draw on proven ideas from the open-source routing gateway ecosystem.
 
@@ -44,9 +46,9 @@ Output tokens are the expensive ones, so the proxy appends a terse-output system
 - **Context-aware escalation** (on by default): a flat level either wastes tokens early in a session (short context, replies could afford detail) or under-saves later. The level steps *up* the ladder as the request's own context grows — `caveman-lite` → `caveman-full` at 20k tokens → `caveman-ultra` at 60k. It never downgrades and never crosses a family or register boundary (Wenyan stays Wenyan, Ponytail stays Ponytail)
 - Injected once per request (idempotent) — a request that already carries the style is left alone, and escalating onto a body that already has a level of the same family will not stack a second, contradictory prompt
 - Chat endpoints only: `/chat/completions`, `/responses`, `/messages` and Gemini `:generateContent`. Embeddings, model lists and audio calls pass through untouched
-- Change the level: `token-saver proxy style ponytail-full` · HTTP: `POST /api/style` · TUI: press `y` on the Proxy page
-- Tune or pin the escalation: `token-saver proxy style escalate off` (pin the level) · `token-saver proxy style escalate 10000,40000,90000` · HTTP: `POST /api/style {"escalate": false}` · TUI: press `u` · env: `TOKENSAVER_OUTPUT_STYLE_ESCALATE=off`, `TOKENSAVER_OUTPUT_STYLE_ESCALATE_AT=20000,60000`
-- Kill switch: `TOKENSAVER_OUTPUT_STYLE=off` or `token-saver proxy style off`
+- Change the level: `nobleed proxy style ponytail-full` · HTTP: `POST /api/style` · TUI: press `y` on the Proxy page
+- Tune or pin the escalation: `nobleed proxy style escalate off` (pin the level) · `nobleed proxy style escalate 10000,40000,90000` · HTTP: `POST /api/style {"escalate": false}` · TUI: press `u` · env: `NOBLEED_OUTPUT_STYLE_ESCALATE=off`, `NOBLEED_OUTPUT_STYLE_ESCALATE_AT=20000,60000`
+- Kill switch: `NOBLEED_OUTPUT_STYLE=off` or `nobleed proxy style off`
 
 #### Compaction Checkpoint Format
 Structured Markdown checkpoint for conversation summarization:
@@ -151,9 +153,9 @@ Detects unproductive agent patterns:
 ### Daily Limits (never blocks by default)
 
 - **No silent blocking**: reaching the daily token limit or budget never rejects or silently reroutes a request
-- **You choose**: the TUI Quota page (`r` = reset counters, `b` = stay blocked), the desktop Quota screen, or `token-saver budget reset|block|unblock`
+- **You choose**: the TUI Quota page (`r` = reset counters, `b` = stay blocked), the desktop Quota screen, or `nobleed budget reset|block|unblock`
 - **Tracked, not enforced**: spend/tokens are still recorded in `~/.config/opencode/compress/budget_daily.json`; the free-model guard only activates after you explicitly answer "stay blocked" for the day (decision stored in `budget_daily.json`'s sibling `limit_decision.json`, expiring at midnight)
-- **Last-resort kill switch**: `TOKENSAVER_BUDGET_ENFORCE=0` disables the guard even after you opted in
+- **Last-resort kill switch**: `NOBLEED_BUDGET_ENFORCE=0` disables the guard even after you opted in
 
 ### Quota Tracking
 
@@ -177,7 +179,7 @@ Detects unproductive agent patterns:
 ## Architecture
 
 ```
-bloody/
+nobleed/
 ├── src/
 │   ├── banner.ts          # ASCII art + APP_NAME
 │   ├── index.tsx          # Entry point (TUI or CLI)
@@ -229,15 +231,22 @@ bloody/
 
 ## Requirements
 
-- Node.js v22+
+- Node.js v22.13+ (Node 24 LTS recommended)
 - npm 10+
+
+SQLite comes from either the native `better-sqlite3` module (optional) or the
+`node:sqlite` module built into Node, so no C++ toolchain is required.
 
 ## Installation
 
 ```bash
-cd cli
 npm install
 ```
+
+Nothing else is needed: `npm run dev`, `npm start`, `npm test` and `npm run build`
+all run `scripts/ensure-deps.mjs` first, which installs the dependencies when
+`node_modules/` is missing — a fresh clone works even if `npm install` was never
+run, and `'tsx' is not recognized` cannot happen.
 
 ## Usage
 
@@ -306,23 +315,58 @@ npx tsx src/index.tsx caveman inject --level ultra '{"messages":[]}'
 - **Reminders**: `~/.config/opencode/reminders.json`
 - **Spill**: `~/.config/opencode/spill/`
 
-Override config directory with `TOKENSAVER_HOME` environment variable.
+Override config directory with `NOBLEED_HOME` (the pre-rename `TOKENSAVER_HOME` still works).
 
 ## Development
 
 ```bash
 npm run typecheck   # Type checking
-npm test            # Run all 97 tests
+npm test            # Run all 162 tests
+npm run verify      # Encoding check + typecheck + tests (the CI gate)
 npm run build       # Build for production
 ```
 
 ### Tech Stack
 
-- **Runtime**: Node.js v22+ with ESM
+- **Runtime**: Node.js v22.13+ with ESM
 - **TUI**: React 19 + Ink 7 (terminal UI framework)
-- **Database**: better-sqlite3 (FTS5 search)
+- **Database**: better-sqlite3 (optional) falling back to `node:sqlite` (FTS5 search)
 - **Language**: TypeScript 5.9+ (strict mode)
 - **Testing**: Node.js test runner + tsx
+
+## Troubleshooting
+
+**`'tsx' is not recognized as an internal or external command`** (Windows) or
+**`tsx: command not found`** (macOS/Linux)
+
+The dependencies are not installed. `npm run dev`, `npm start`, `npm test` and
+`npm run build` now install them on demand, but you can always do it directly:
+
+```bash
+npm install        # or: npm run deps
+```
+
+**`gyp ERR! find VS` / `node-gyp` output while installing `better-sqlite3`**
+
+`better-sqlite3` ships prebuilt binaries, but an install that replays a lockfile
+still asks node-gyp to rebuild the module, which needs a C++ toolchain. It is an
+*optional* dependency: when that build cannot run, npm skips it, the install
+still finishes, and the app uses the SQLite bundled with Node (`node:sqlite`).
+To get the native module without a compiler, resolve it from the registry — that
+path uses the bundled prebuild:
+
+```bash
+npm run sqlite:native     # npm install better-sqlite3
+```
+
+**The TUI prints "needs an interactive terminal" and exits**
+
+`npm run dev` was started with piped stdin — a script, a CI job, or a terminal
+that does not report a TTY. Run it in a real terminal, or use the CLI:
+
+```bash
+npm run dev -- help
+```
 
 ## Data Source
 

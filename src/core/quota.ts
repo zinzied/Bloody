@@ -26,6 +26,7 @@ export class QuotaTracker {
   dataFile: string;
   _quotaData: { providers: Record<string, any>; accounts: Record<string, any> };
   _mtime = 0;
+  _size = -1;
 
   constructor() {
     this.dataFile = QUOTA_TRACKER_PATH;
@@ -35,29 +36,42 @@ export class QuotaTracker {
   _load(): { providers: Record<string, any>; accounts: Record<string, any> } {
     const data = readJson<{ providers?: Record<string, any>; accounts?: Record<string, any> }>(this.dataFile, null);
     if (data && data.providers && data.accounts) {
-      try {
-        this._mtime = fs.statSync(this.dataFile).mtimeMs;
-      } catch {}
+      this._stamp();
       return { providers: data.providers, accounts: data.accounts };
     }
     return { providers: {}, accounts: {} };
   }
 
+  /** What the file looked like on disk right after our own read or write. */
+  _stamp(): void {
+    try {
+      const st = fs.statSync(this.dataFile);
+      this._mtime = st.mtimeMs;
+      this._size = st.size;
+    } catch {}
+  }
+
   _refresh(): void {
     let mtime = 0;
+    let size = -1;
     try {
-      mtime = fs.statSync(this.dataFile).mtimeMs;
+      const st = fs.statSync(this.dataFile);
+      mtime = st.mtimeMs;
+      size = st.size;
     } catch {
       return;
     }
-    if (mtime !== this._mtime) this._quotaData = this._load();
+    // mtime alone is not enough: on Windows two writes inside the same
+    // millisecond carry the same timestamp, so a file another process rewrote
+    // right after ours looked untouched and the stale copy was served until the
+    // process restarted. The size moves with any real rewrite, so the pair
+    // catches what the clock misses.
+    if (mtime !== this._mtime || size !== this._size) this._quotaData = this._load();
   }
 
   _save(): void {
     writeJson(this.dataFile, this._quotaData);
-    try {
-      this._mtime = fs.statSync(this.dataFile).mtimeMs;
-    } catch {}
+    this._stamp();
   }
 
   update_quota(provider: string, model: string | null = null, opts: QuotaOpts = {}): void {

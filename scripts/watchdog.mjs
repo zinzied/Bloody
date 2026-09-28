@@ -5,13 +5,17 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// NOBLEED_* is the current spelling, TOKENSAVER_* is still read for units and
+// shells that predate the rename.
+const env = (name) => process.env[`NOBLEED_${name}`] ?? process.env[`TOKENSAVER_${name}`];
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const STATE_DIR = path.join(process.env.TOKENSAVER_HOME || os.homedir(), '.config', 'opencode', 'compress');
+const STATE_DIR = path.join(env('HOME') || os.homedir(), '.config', 'opencode', 'compress');
 const LOCK_PATH = path.join(STATE_DIR, 'watchdog.lock');
 const LOG_PATH = path.join(STATE_DIR, 'watchdog.log');
 const ENTRY = path.join(ROOT, 'dist', 'index.js');
-const PORT = Number(process.env.TOKENSAVER_PROXY_PORT || 8199);
-const HEALTH_MS = Number(process.env.TOKENSAVER_WATCHDOG_HEALTH_MS || 15000);
+const PORT = Number(env('PROXY_PORT') || 8199);
+const HEALTH_MS = Number(env('WATCHDOG_HEALTH_MS') || 15000);
 const BACKOFF_MS = [1000, 2000, 5000, 10000, 15000, 30000];
 
 fs.mkdirSync(STATE_DIR, { recursive: true });

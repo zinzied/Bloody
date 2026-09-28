@@ -12,14 +12,15 @@ import path from 'node:path';
 import { fmt } from '../tui/components.js';
 import { BANNER, APP_NAME } from '../banner.js';
 
-const HELP = `${BANNER}${APP_NAME} CLI v${config.TS_VERSION} — reduce token waste and spending when using AI coding models
+const HELP = `${BANNER}${APP_NAME} CLI v${config.TS_VERSION} — stop the token bleed: reduce token waste and spending when using AI coding models
 
 USAGE
-  token-saver [command] [args...]   run a subcommand (non-interactive)
-  token-saver setup [--port N] [--no-autostart]
+  nobleed [command] [args...]       run a subcommand (non-interactive)
+  nobleed setup [--port N] [--no-autostart]
                                     one-command install for any PC: build + proxify + watchdog +
                                     OS autostart (Startup/LaunchAgent/systemd). Re-runnable.
-  token-saver [--tui|-i]            launch the interactive TUI (default when run without a command)
+  nobleed [--tui|-i]                launch the interactive TUI (default when run without a command)
+  legacy alias                      token-saver <command> does the same as nobleed <command>
 
 COMMANDS
   overview | status                 summary of ledger + proxy savings
@@ -411,7 +412,7 @@ async function cmdProxy(args: string[]): Promise<number> {
         if (!arg) {
           out(`Escalation  : ${esc.enabled ? 'on' : 'off'}`);
           out(`At          : ${esc.at.join(', ')} tokens (steps the level up at each size)`);
-          out('Example     : token-saver proxy style escalate off | on | 10000,40000,90000');
+          out('Example     : nobleed proxy style escalate off | on | 10000,40000,90000');
           return 0;
         }
         const cfg = proxy.loadConfig();
@@ -440,7 +441,7 @@ async function cmdProxy(args: string[]): Promise<number> {
           out(
             next.enabled
               ? `Escalation  : on — level steps up at ${next.at.join(', ')} tokens`
-              : `Escalation  : off — ${next.at.join(', ')} tokens stored but TOKENSAVER_OUTPUT_STYLE_ESCALATE pins it off`
+              : `Escalation  : off — ${next.at.join(', ')} tokens stored but NOBLEED_OUTPUT_STYLE_ESCALATE pins it off`
           );
         } else {
           out(`Unrecognised: ${arg}`);
@@ -458,7 +459,7 @@ async function cmdProxy(args: string[]): Promise<number> {
         out(`Applied to  : ${fmt(s.outputStyleApplied)} request(s)`);
         if (s.outputStyleEscalate) {
           out(`Escalation  : on — past ${esc.at.join('/')} tokens the level steps up (${fmt(s.outputStyleEscalated ?? 0)} request(s) escalated)`);
-          out(`             off with: token-saver proxy style escalate off`);
+          out(`             off with: nobleed proxy style escalate off`);
         } else {
           out('Escalation  : off (level pinned)');
         }
@@ -772,7 +773,7 @@ async function cmdSetup(args: string[]): Promise<number> {
   const lines = await setup.runSetup({ port, noAutostart: bools.has('no-autostart') });
   for (const line of lines) out(`  ${line}`);
   out();
-  out('Uninstall: token-saver proxy stop && token-saver proxy restore');
+  out('Uninstall: nobleed proxy stop && nobleed proxy restore');
   return 0;
 }
 
@@ -801,13 +802,13 @@ function cmdDoctor(args: string[]): number {
     out();
   }
   if (!fix && d.issues.some((i: string) => i.includes('stale rate_limit'))) {
-    out('Hint: run `token-saver doctor --fix` to clear only expired rate_limits (safe).');
+    out('Hint: run `nobleed doctor --fix` to clear only expired rate_limits (safe).');
     out('Auto-clear is GOOD for stale TTLs (rate_limited_until < now) — bad for 401 auth failures inside window (hides real bad key).');
   }
   if (d.budgetStatus?.limitReached) {
     out('Daily limit reached — the proxy is NOT blocked; it keeps using your configured model until you answer.');
-    out('  choose: `token-saver budget reset` (clear counters, keep configured model) or `token-saver budget block` (stay blocked → free-model guard).');
-    out('  `token-saver budget unblock` clears your choice so you get asked again.');
+    out('  choose: `nobleed budget reset` (clear counters, keep configured model) or `nobleed budget block` (stay blocked → free-model guard).');
+    out('  `nobleed budget unblock` clears your choice so you get asked again.');
   }
   return d.ok ? 0 : 1;
 }
@@ -865,7 +866,7 @@ export async function runCommand(argv: string[]): Promise<number> {
       return cmdRecall(rest);
     default:
       outErr(`Unknown command: ${cmd}`);
-      outErr(`Run "token-saver help" for usage.`);
+      outErr(`Run "nobleed help" for usage.`);
       return 1;
   }
 }

@@ -31,12 +31,19 @@ function installWindows(root: string, nodePath: string): string[] {
   logs.push(`vbs: ${vbs}`);
   const startup = path.join(os.homedir(), 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup');
   ensureDir(startup);
-  const lnk = path.join(startup, 'TokenSaver Proxy.lnk');
-  const ps = `$sh=New-Object -COM WScript.Shell;$lnk=$sh.CreateShortcut('${lnk.replace(/'/g, "''")}');$lnk.TargetPath='C:\\Windows\\System32\\wscript.exe';$lnk.Arguments='//B //Nologo "${vbs.replace(/"/g, '""')}"';$lnk.WorkingDirectory='${root.replace(/'/g, "''")}';$lnk.WindowStyle=7;$lnk.Description='Token Saver proxy watchdog';$lnk.Save()`;
+  // A machine that ran setup before the rename still has the old shortcut there,
+  // and two autostart entries mean two watchdogs fighting over the same port.
+  for (const stale of ['TokenSaver Proxy.lnk', 'TokenSaver Proxy.bat']) {
+    try {
+      fs.rmSync(path.join(startup, stale), { force: true });
+    } catch {}
+  }
+  const lnk = path.join(startup, 'NoBleed Proxy.lnk');
+  const ps = `$sh=New-Object -COM WScript.Shell;$lnk=$sh.CreateShortcut('${lnk.replace(/'/g, "''")}');$lnk.TargetPath='C:\\Windows\\System32\\wscript.exe';$lnk.Arguments='//B //Nologo "${vbs.replace(/"/g, '""')}"';$lnk.WorkingDirectory='${root.replace(/'/g, "''")}';$lnk.WindowStyle=7;$lnk.Description='NoBleed proxy watchdog';$lnk.Save()`;
   const r = spawnSync('powershell.exe', ['-NoProfile', '-Command', ps], { stdio: 'pipe' });
   if (r.status === 0 && fs.existsSync(lnk)) logs.push(`autostart: ${lnk}`);
   else {
-    const bat = path.join(startup, 'TokenSaver Proxy.bat');
+    const bat = path.join(startup, 'NoBleed Proxy.bat');
     fs.writeFileSync(bat, `@echo off\r\nwscript //B //Nologo "${vbs}"\r\n`, 'utf-8');
     logs.push(`autostart (fallback bat): ${bat}`);
   }
@@ -47,10 +54,19 @@ function installMac(root: string, nodePath: string): string[] {
   const logs: string[] = [];
   const dir = path.join(os.homedir(), 'Library', 'LaunchAgents');
   ensureDir(dir);
-  const plist = path.join(dir, 'com.tokensaver.proxy.plist');
+  // Removed before the new plist is written: launchd was loading both, and the
+  // old one would keep spawning a second watchdog.
+  const stalePlist = path.join(dir, 'com.tokensaver.proxy.plist');
+  if (fs.existsSync(stalePlist)) {
+    spawnSync('launchctl', ['unload', stalePlist], { stdio: 'ignore' });
+    try {
+      fs.rmSync(stalePlist, { force: true });
+    } catch {}
+  }
+  const plist = path.join(dir, 'com.nobleed.proxy.plist');
   const watchdog = path.join(root, 'scripts', 'watchdog.mjs');
   const logOut = path.join(os.homedir(), '.config', 'opencode', 'compress', 'watchdog.log');
-  const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>com.tokensaver.proxy</string>\n<key>ProgramArguments</key><array><string>${nodePath}</string><string>${watchdog}</string></array>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>StandardOutPath</key><string>${logOut}</string>\n<key>StandardErrorPath</key><string>${logOut}</string>\n</dict></plist>\n`;
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>com.nobleed.proxy</string>\n<key>ProgramArguments</key><array><string>${nodePath}</string><string>${watchdog}</string></array>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>StandardOutPath</key><string>${logOut}</string>\n<key>StandardErrorPath</key><string>${logOut}</string>\n</dict></plist>\n`;
   fs.writeFileSync(plist, xml, 'utf-8');
   logs.push(`plist: ${plist}`);
   spawnSync('launchctl', ['unload', plist], { stdio: 'ignore' });
@@ -65,18 +81,30 @@ function installLinux(root: string, nodePath: string): string[] {
   const watchdog = path.join(root, 'scripts', 'watchdog.mjs');
   const autostartDir = path.join(os.homedir(), '.config', 'autostart');
   ensureDir(autostartDir);
-  const desktop = path.join(autostartDir, 'tokensaver-proxy.desktop');
-  fs.writeFileSync(desktop, `[Desktop Entry]\nType=Application\nName=Token Saver Proxy\nExec=${nodePath} ${watchdog}\nHidden=false\nNoDisplay=false\nX-GNOME-Autostart-enabled=true\n`, 'utf-8');
+  // The stale desktop entry is dropped first so a machine that ran setup before
+  // the rename does not autostart two watchdogs.
+  try {
+    fs.rmSync(path.join(autostartDir, 'tokensaver-proxy.desktop'), { force: true });
+  } catch {}
+  const desktop = path.join(autostartDir, 'nobleed-proxy.desktop');
+  fs.writeFileSync(desktop, `[Desktop Entry]\nType=Application\nName=NoBleed Proxy\nExec=${nodePath} ${watchdog}\nHidden=false\nNoDisplay=false\nX-GNOME-Autostart-enabled=true\n`, 'utf-8');
   logs.push(`autostart: ${desktop}`);
   const sysDir = path.join(os.homedir(), '.config', 'systemd', 'user');
   ensureDir(sysDir);
-  const svc = path.join(sysDir, 'tokensaver-proxy.service');
-  fs.writeFileSync(svc, `[Unit]\nDescription=Token Saver Proxy Watchdog\nAfter=network.target\n[Service]\nExecStart=${nodePath} ${watchdog}\nRestart=always\nRestartSec=3\n[Install]\nWantedBy=default.target\n`, 'utf-8');
+  const staleUnit = path.join(sysDir, 'tokensaver-proxy.service');
+  if (fs.existsSync(staleUnit)) {
+    spawnSync('systemctl', ['--user', 'disable', '--now', 'tokensaver-proxy.service'], { stdio: 'ignore' });
+    try {
+      fs.rmSync(staleUnit, { force: true });
+    } catch {}
+  }
+  const svc = path.join(sysDir, 'nobleed-proxy.service');
+  fs.writeFileSync(svc, `[Unit]\nDescription=NoBleed Proxy Watchdog\nAfter=network.target\n[Service]\nExecStart=${nodePath} ${watchdog}\nRestart=always\nRestartSec=3\n[Install]\nWantedBy=default.target\n`, 'utf-8');
   logs.push(`systemd: ${svc}`);
   const hasSystemctl = spawnSync('which', ['systemctl'], { stdio: 'ignore' }).status === 0 || spawnSync('command', ['-v', 'systemctl'], { stdio: 'ignore', shell: true }).status === 0;
   if (hasSystemctl) {
     spawnSync('systemctl', ['--user', 'daemon-reload'], { stdio: 'ignore' });
-    const r = spawnSync('systemctl', ['--user', 'enable', '--now', 'tokensaver-proxy.service'], { stdio: 'pipe' });
+    const r = spawnSync('systemctl', ['--user', 'enable', '--now', 'nobleed-proxy.service'], { stdio: 'pipe' });
     if (r.status === 0) logs.push('systemd: enabled --now');
     else logs.push(`systemd: enable failed — ${String(r.stderr || '').trim().slice(0, 200)}`);
   }

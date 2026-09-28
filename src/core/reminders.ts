@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { envValue } from './utils.js';
 
 export interface Reminder {
   id: string;
@@ -15,7 +16,7 @@ export interface ReminderStore {
 }
 
 function reminderPath(): string {
-  const home = process.env.TOKENSAVER_HOME || path.join(
+  const home = envValue('HOME') || path.join(
     process.env.HOME || process.env.USERPROFILE || '.',
     '.config', 'opencode',
   );

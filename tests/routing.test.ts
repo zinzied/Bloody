@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-routing-'));
-process.env.TOKENSAVER_HOME = TMP;
+process.env.NOBLEED_HOME = TMP;
 
 const routing = await import('../src/core/routing.js');
 

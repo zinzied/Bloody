@@ -89,7 +89,7 @@ export function ProxyScreen({ enginePort }: { enginePort: number | null }) {
             </table>
           </div>
         ) : (
-          <div className="hint">No providers proxied yet. Run <code>token-saver proxy proxify</code> to auto-add configured providers.</div>
+          <div className="hint">No providers proxied yet. Run <code>nobleed proxy proxify</code> to auto-add configured providers.</div>
         )}
       </section>
 

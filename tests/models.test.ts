@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-models-'));
-process.env.TOKENSAVER_HOME = TMP;
+process.env.NOBLEED_HOME = TMP;
 process.env.OPENAI_API_KEY = 'sk-test';
 process.env.DEEPSEEK_API_KEY = 'ds-test';
 process.env.GLM_API_KEY = 'glm-test';

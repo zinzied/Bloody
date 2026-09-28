@@ -1,5 +1,5 @@
 import * as config from './config.js';
-import { readJson, writeJson } from './utils.js';
+import { readJson, writeJson, envValue } from './utils.js';
 import * as rtk from './filters/rtk.js';
 import * as routingMod from './routing.js';
 import { accountManager, resolveUpstream } from './proxy.js';
@@ -433,7 +433,7 @@ export function doctorSummary(opts: { fix?: boolean } = {}) {
   // tokenizer
   if (!tokenizer.available) issues.push(`tokenizer fallback heuristic — js-tiktoken not loaded (${tokenizer.error || 'missing'})`);
   // proxy
-  if (!pcfg.enabled) issues.push('proxy disabled — requests bypass token-saver');
+  if (!pcfg.enabled) issues.push('proxy disabled — requests bypass nobleed');
   else if (!pcfg.proxied_providers?.length) issues.push('proxy has no proxied_providers — check proxy proxify');
   // model
   if (!currentModel) issues.push('no model configured in opencode.jsonc');
@@ -476,7 +476,7 @@ export function doctorSummary(opts: { fix?: boolean } = {}) {
     budgetStatus,
     tokenizer,
     proxy: pcfg,
-    outputStyle: resolveOutputStyle(pcfg.output_style ?? process.env.TOKENSAVER_OUTPUT_STYLE).label,
+    outputStyle: resolveOutputStyle(pcfg.output_style ?? envValue('OUTPUT_STYLE')).label,
     config: cfg,
     currentModel,
     providers,

@@ -6,7 +6,7 @@ import os from 'node:os';
 import http from 'node:http';
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-limits-'));
-process.env.TOKENSAVER_HOME = TMP;
+process.env.NOBLEED_HOME = TMP;
 
 const budget = await import('../src/core/budget.js');
 const proxy = await import('../src/core/proxy.js');

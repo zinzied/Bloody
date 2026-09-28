@@ -5,7 +5,7 @@ import path from 'node:path';
 import os from 'node:os';
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-newfeatures-'));
-process.env.TOKENSAVER_HOME = TMP;
+process.env.NOBLEED_HOME = TMP;
 
 const rtk = await import('../src/core/filters/rtk.js');
 const tokens = await import('../src/core/tokens.js');

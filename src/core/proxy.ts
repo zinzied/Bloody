@@ -3,7 +3,7 @@ import https from 'node:https';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { nowIso, readJson, writeJson, ensureDir } from './utils.js';
+import { nowIso, readJson, writeJson, ensureDir, envValue } from './utils.js';
 import { PROXY_CONFIG, CACHE_PATH, SAVER_POLICY_PATH, read_config, read_merged_config, config_env_credential, find_original_provider_base_url, provider_id_key, provider_entry, get_current_model, set_provider_base_urls, restore_provider_base_urls } from './config.js';
 import { readCatalogCache, get_user_models_sync, model_total_cost } from './models.js';
 import * as rtk from './filters/rtk.js';
@@ -96,7 +96,10 @@ const PREFER_HEADERS = new Set([
 
 // The `x-*` allow-rule below forwards every extension header, which would hand
 // this project's own control-plane credential to the LLM provider.
-const STRIP_HEADERS = new Set(['x-token-saver']);
+// Both spellings are dropped before a request goes upstream: the control header
+// was renamed with the project, and a client built before that still sends the
+// old name.
+const STRIP_HEADERS = new Set(['x-nobleed', 'x-token-saver']);
 
 // Every header that can carry a credential, so a swap can clear all of them
 // before writing the replacement. Leaving a stale one behind is what makes an
@@ -134,10 +137,10 @@ const _metrics: {
 
 // ---------------------------------------------------------------------------
 // Output style: ALWAYS ON while the proxy runs (terse-output prompt), unless
-// TOKENSAVER_OUTPUT_STYLE=off or proxy.json says "output_style": "off".
+// NOBLEED_OUTPUT_STYLE=off or proxy.json says "output_style": "off".
 // Output tokens are the expensive ones, so this runs on every chat request.
 // ---------------------------------------------------------------------------
-let _outputStyle: prompts.OutputStyleSetting = prompts.resolveOutputStyle(process.env.TOKENSAVER_OUTPUT_STYLE);
+let _outputStyle: prompts.OutputStyleSetting = prompts.resolveOutputStyle(envValue('OUTPUT_STYLE'));
 let _styleLogged = false;
 // Context-aware escalation: step the level up as the request's own context grows.
 let _styleEscalate = true;
@@ -165,8 +168,8 @@ function _truthyFlag(value: unknown, fallback: boolean): boolean {
 /** Re-read the escalation policy from env then proxy.json. */
 function loadStyleEscalation(cfg?: ProxyConfig): void {
   const c = cfg ?? loadConfig();
-  const env = process.env.TOKENSAVER_OUTPUT_STYLE_ESCALATE;
-  const envAt = process.env.TOKENSAVER_OUTPUT_STYLE_ESCALATE_AT;
+  const env = envValue('OUTPUT_STYLE_ESCALATE');
+  const envAt = envValue('OUTPUT_STYLE_ESCALATE_AT');
   _styleEscalate = _truthyFlag(env !== undefined ? env : c.output_style_escalate, true);
   _styleEscalateAt = prompts.resolveEscalateAt(
     envAt !== undefined && envAt !== '' ? envAt : c.output_style_escalate_at
@@ -180,7 +183,7 @@ function loadStyleEscalation(cfg?: ProxyConfig): void {
 export function setOutputStyle(value?: string | null): prompts.OutputStyleSetting {
   let wanted = value;
   if (wanted === undefined || wanted === null || wanted === '') {
-    wanted = process.env.TOKENSAVER_OUTPUT_STYLE || (loadConfig().output_style ?? null);
+    wanted = envValue('OUTPUT_STYLE') || (loadConfig().output_style ?? null);
   }
   _outputStyle = prompts.resolveOutputStyle(wanted);
   loadStyleEscalation();
@@ -204,7 +207,7 @@ function ensureSettingsLoaded(): void {
   _settingsLoaded = true;
   const cfg = loadConfig();
   if (!_outputStyle || _outputStyle.style === 'caveman') {
-    const wanted = process.env.TOKENSAVER_OUTPUT_STYLE || cfg.output_style;
+    const wanted = envValue('OUTPUT_STYLE') || cfg.output_style;
     if (wanted) _outputStyle = prompts.resolveOutputStyle(wanted);
   }
   loadStyleEscalation(cfg);
@@ -217,7 +220,7 @@ export function setOutputStyleEscalation(
 ): { enabled: boolean; at: number[] } {
   const cfg = loadConfig();
   if (enabled !== undefined) _styleEscalate = !!enabled;
-  else _styleEscalate = _truthyFlag(process.env.TOKENSAVER_OUTPUT_STYLE_ESCALATE, cfg.output_style_escalate ?? true);
+  else _styleEscalate = _truthyFlag(envValue('OUTPUT_STYLE_ESCALATE'), cfg.output_style_escalate ?? true);
   if (at && at.length) _styleEscalateAt = prompts.resolveEscalateAt(at);
   else _styleEscalateAt = prompts.resolveEscalateAt(cfg.output_style_escalate_at);
   return { enabled: _styleEscalate, at: [..._styleEscalateAt] };
@@ -276,7 +279,7 @@ function applyAlwaysOnStyle(pathOnly: string, body: RequestBody | null | undefin
             ? ` → up to ${_outputStyle.style}-${top} past ${_styleEscalateAt.join('/')} tok`
             : '';
         console.log(
-          `[style] output style ON: ${_outputStyle.label}${escalation} (set TOKENSAVER_OUTPUT_STYLE=off to disable)`
+          `[style] output style ON: ${_outputStyle.label}${escalation} (set NOBLEED_OUTPUT_STYLE=off to disable)`
         );
       }
       return {
@@ -445,7 +448,7 @@ function isSelfUrl(url: string): boolean {
 }
 
 function authFilePaths(): string[] {
-  const home = process.env.TOKENSAVER_HOME || os.homedir();
+  const home = envValue('HOME') || os.homedir();
   return [
     path.join(home, '.local', 'share', 'opencode', 'auth.json'),
     path.join(home, '.config', 'opencode', 'auth.json'),
@@ -1224,7 +1227,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     let budgetEnforced = false;
     let originalModelId = modelId;
     let enforcedFallback: string | null = null;
-    const guardAllowed = process.env.TOKENSAVER_BUDGET_ENFORCE !== '0';
+    const guardAllowed = envValue('BUDGET_ENFORCE') !== '0';
     if (data) {
       try {
         const check = budget.shouldEnforceBudget();
@@ -1258,7 +1261,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     // Rate-limit aware routing: transparently reroute to a healthy provider when
     // the requested provider is marked rate-limited (kills client retry loops).
     let rateLimitReroutedFrom: string | null = null;
-    if (data && !budgetEnforced && process.env.TOKENSAVER_RATELIMIT_FALLBACK !== '0') {
+    if (data && !budgetEnforced && envValue('RATELIMIT_FALLBACK') !== '0') {
       try {
         const reqProvider = requestedProvider;
         if (reqProvider && quotaTracker.is_rate_limited(reqProvider)) {
@@ -1582,8 +1585,8 @@ export function start(port?: number): Promise<ProxyStatus> {
   return new Promise((resolve, reject) => {
     if (_server) return resolve(status());
     // Daily limits never block by default: the user answers "reset" / "stay blocked" from the UI.
-    // Set TOKENSAVER_BUDGET_ENFORCE=0 to hard-disable the guard even after you opted in.
-    if (process.env.TOKENSAVER_RATELIMIT_FALLBACK === undefined) process.env.TOKENSAVER_RATELIMIT_FALLBACK = '1';
+    // Set NOBLEED_BUDGET_ENFORCE=0 to hard-disable the guard even after you opted in.
+    if (envValue('RATELIMIT_FALLBACK') === undefined) process.env.NOBLEED_RATELIMIT_FALLBACK = '1';
     const targetPort = port !== undefined && port !== null ? port : loadConfig().port || DEFAULT_PORT;
     // Another process (watchdog, desktop app, an earlier CLI) may already own the
     // port. Adopting it keeps `proxy start` idempotent instead of losing the bind
@@ -1607,13 +1610,13 @@ function adoptRunningProxy(targetPort: number): Promise<ProxyStatus | null> {
 function listen(targetPort: number, resolve: (s: ProxyStatus) => void, reject: (e: Error) => void) {
   rtk.set_filter_caps && rtk.set_filter_caps(loadConfig().caps || {});
   // Output style is ALWAYS ON while the proxy runs (terse replies = fewer output
-  // tokens). Override with TOKENSAVER_OUTPUT_STYLE or proxy.json "output_style".
+  // tokens). Override with NOBLEED_OUTPUT_STYLE or proxy.json "output_style".
   const style = setOutputStyle(undefined);
   _styleLogged = false;
   console.log(
     style.style === 'off'
       ? '[style] output style OFF — responses will be at full length'
-      : `[style] output style: ${style.label} (always on while the proxy runs · ~${tokens.count_tokens(style.prompt)} tokens/request · TOKENSAVER_OUTPUT_STYLE=off to disable)`
+      : `[style] output style: ${style.label} (always on while the proxy runs · ~${tokens.count_tokens(style.prompt)} tokens/request · NOBLEED_OUTPUT_STYLE=off to disable)`
   );
   const proxify = ensureProxiedProviders(targetPort, true);
   if (proxify.rewritten.length) {
@@ -1637,7 +1640,10 @@ function listen(targetPort: number, resolve: (s: ProxyStatus) => void, reject: (
 
 function exportSessionSummary(): void {
   try {
-    const memDir = path.join(os.homedir(), '.claude', 'projects', 'C--Users-zinzi-Desktop-Bloody', 'memory');
+    // Claude Code keys project memory by a slug of the checkout path, so derive
+    // it from the current directory instead of pinning one machine's folder name.
+    const slug = process.cwd().replace(/[\\/:]/g, '-').replace(/[^A-Za-z0-9-]+/g, '-');
+    const memDir = path.join(os.homedir(), '.claude', 'projects', slug, 'memory');
     ensureDir(memDir);
     const s = status();
     const today = new Date().toISOString().slice(0, 10);

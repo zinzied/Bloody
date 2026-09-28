@@ -5,7 +5,7 @@ import path from 'node:path';
 import os from 'node:os';
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-quota-'));
-process.env.TOKENSAVER_HOME = TMP;
+process.env.NOBLEED_HOME = TMP;
 
 const { QuotaTracker, parse_rate_limit_headers } = await import('../src/core/quota.js');
 

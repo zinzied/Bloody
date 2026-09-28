@@ -6,7 +6,7 @@ import os from 'node:os';
 import http from 'node:http';
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-style-'));
-process.env.TOKENSAVER_HOME = TMP;
+process.env.NOBLEED_HOME = TMP;
 
 const prompts = await import('../src/core/prompts.js');
 const proxy = await import('../src/core/proxy.js');
@@ -156,7 +156,7 @@ test('styleEligible only accepts chat-shaped requests', () => {
 // ---------------------------------------------------------------------------
 
 test('proxy applies the output style to every chat request while it runs', async () => {
-  delete process.env.TOKENSAVER_OUTPUT_STYLE;
+  delete process.env.NOBLEED_OUTPUT_STYLE;
   const seen: { body: string; path: string }[] = [];
   const mock = mockUpstream(seen);
   const mockPort = await listen(mock);
@@ -216,8 +216,8 @@ test('proxy applies the output style to every chat request while it runs', async
   }
 });
 
-test('TOKENSAVER_OUTPUT_STYLE=off disables the style at start', async () => {
-  process.env.TOKENSAVER_OUTPUT_STYLE = 'off';
+test('NOBLEED_OUTPUT_STYLE=off disables the style at start', async () => {
+  process.env.NOBLEED_OUTPUT_STYLE = 'off';
   try {
     await proxy.start(0);
     try {
@@ -227,7 +227,7 @@ test('TOKENSAVER_OUTPUT_STYLE=off disables the style at start', async () => {
       await proxy.stop();
     }
   } finally {
-    delete process.env.TOKENSAVER_OUTPUT_STYLE;
+    delete process.env.NOBLEED_OUTPUT_STYLE;
     proxy.setOutputStyle('caveman-lite');
   }
 });
@@ -237,7 +237,9 @@ test('/api/style reports and changes the active style', async () => {
   await proxy.start(0);
   try {
     const port = proxy.status().port;
-    const headers = { 'X-Token-Saver': controlToken() };
+    // X-NoBleed is the header the desktop app sends; the test below keeps
+    // covering the legacy X-Token-Saver spelling.
+    const headers = { 'X-NoBleed': controlToken() };
 
     const before = await request('GET', port, '/api/style', undefined, headers);
     assert.strictEqual(before.status, 200);
@@ -410,7 +412,7 @@ test('the injected style bytes are identical on every request', () => {
 // ---------------------------------------------------------------------------
 
 test('proxy escalates the level once the request context is large', async () => {
-  delete process.env.TOKENSAVER_OUTPUT_STYLE;
+  delete process.env.NOBLEED_OUTPUT_STYLE;
   const seen: { body: string; path: string }[] = [];
   const mock = mockUpstream(seen);
   const mockPort = await listen(mock);
@@ -583,8 +585,8 @@ test('proxy.nextOutputStyle walks the saved level, not the default', () => {
 });
 test('setting thresholds is a request to retune the ladder, so it turns escalation on', () => {
   const prev = proxy.loadConfig();
-  const prevEnv = process.env.TOKENSAVER_OUTPUT_STYLE_ESCALATE;
-  delete process.env.TOKENSAVER_OUTPUT_STYLE_ESCALATE;
+  const prevEnv = process.env.NOBLEED_OUTPUT_STYLE_ESCALATE;
+  delete process.env.NOBLEED_OUTPUT_STYLE_ESCALATE;
   try {
     // Start pinned off, as `escalate off` leaves it.
     proxy.saveConfig({ ...prev, output_style_escalate: false, output_style_escalate_at: [20000, 60000] });
@@ -603,8 +605,8 @@ test('setting thresholds is a request to retune the ladder, so it turns escalati
     assert.deepStrictEqual(next.at, [10000, 40000]);
     assert.strictEqual(proxy.outputStyleEscalation().enabled, true);
   } finally {
-    if (prevEnv === undefined) delete process.env.TOKENSAVER_OUTPUT_STYLE_ESCALATE;
-    else process.env.TOKENSAVER_OUTPUT_STYLE_ESCALATE = prevEnv;
+    if (prevEnv === undefined) delete process.env.NOBLEED_OUTPUT_STYLE_ESCALATE;
+    else process.env.NOBLEED_OUTPUT_STYLE_ESCALATE = prevEnv;
     proxy.saveConfig(prev);
     proxy.setOutputStyleEscalation(undefined);
   }

@@ -5,7 +5,7 @@ import path from 'node:path';
 import os from 'node:os';
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-multifile-'));
-process.env.TOKENSAVER_HOME = TMP;
+process.env.NOBLEED_HOME = TMP;
 
 const cfgDir = path.join(TMP, '.config', 'opencode');
 fs.mkdirSync(cfgDir, { recursive: true });
