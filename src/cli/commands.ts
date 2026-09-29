@@ -115,6 +115,12 @@ function parseFlags(args: string[]): { positionals: string[]; flags: Record<stri
   return { positionals, flags, bools };
 }
 
+function parsePortFlag(value: unknown): number | null | undefined {
+  if (value === undefined || value === '') return undefined;
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : null;
+}
+
 async function cmdOverview(): Promise<number> {
   const u = insights.usageSummary();
   out(BANNER.trimEnd());
@@ -371,8 +377,13 @@ async function cmdProxy(args: string[]): Promise<number> {
       return 0;
     }
     case 'start': {
-      const s = await proxy.start(flags.port ? Number(flags.port) : undefined);
-      out(`Proxy listening on http://127.0.0.1:${s.port}`);
+      const port = parsePortFlag(flags.port);
+      if (port === null) {
+        outErr(`invalid --port: ${flags.port}`);
+        return 1;
+      }
+      const ts = await proxy.start(port);
+      out(`Proxy listening on http://127.0.0.1:${ts.port}`);
       return 0;
     }
     case 'stop': {
@@ -391,7 +402,12 @@ async function cmdProxy(args: string[]): Promise<number> {
       return 0;
     }
     case 'proxify': {
-      const r = proxy.ensureProxiedProviders(flags.port ? Number(flags.port) : undefined, true);
+      const port = parsePortFlag(flags.port);
+      if (port === null) {
+        outErr(`invalid --port: ${flags.port}`);
+        return 1;
+      }
+      const r = proxy.ensureProxiedProviders(port, true);
       if (r.added.length) out(`Added to proxy: ${r.added.join(', ')}`);
       if (r.already.length) out(`Already proxied: ${r.already.join(', ')}`);
       if (r.skipped.length) out(`Skipped (no known upstream): ${r.skipped.join(', ')}`);
@@ -406,7 +422,12 @@ async function cmdProxy(args: string[]): Promise<number> {
       return 0;
     }
     case 'enable': {
-      proxy.enable(true, flags.port ? Number(flags.port) : undefined);
+      const port = parsePortFlag(flags.port);
+      if (port === null) {
+        outErr(`invalid --port: ${flags.port}`);
+        return 1;
+      }
+      proxy.enable(true, port);
       out('Auto-start enabled.');
       return 0;
     }
@@ -632,7 +653,8 @@ async function cmdModels(args: string[]): Promise<number> {
         if (flags['free-limit'] !== undefined) next.free_daily_token_limit = Number(flags['free-limit']);
         if (flags['max-paid'] !== undefined) next.max_paid_cost_per_million = Number(flags['max-paid']);
         models.write_saver_policy(next);
-        out(`Policy saved: mode=${next.mode} · budget $${next.daily_budget_usd}/day · free limit ${fmt(next.free_daily_token_limit)}/day · max $${next.max_paid_cost_per_million}/M`);
+        const saved = models.read_saver_policy();
+        out(`Policy saved: mode=${saved.mode} · budget $${saved.daily_budget_usd}/day · free limit ${fmt(saved.free_daily_token_limit)}/day · max $${saved.max_paid_cost_per_million}/M`);
         return 0;
       }
       outErr('usage: models policy get|set');

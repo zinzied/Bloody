@@ -259,3 +259,77 @@ test('format_compaction_checkpoint produces structured output', async () => {
   assert.ok(output.includes('- TypeScript'));
   assert.ok(output.includes('- src/auth.ts'));
 });
+
+function makeLineyAnchorText(anchorAt: number, anchor: string): string {
+  const lines: string[] = [];
+  for (let i = 0; i < 320; i++) {
+    lines.push(i === anchorAt ? `ERROR in ${anchor} fix_proxy` : `filler ${i} ${'x'.repeat(80)}`);
+  }
+  return lines.join('\n');
+}
+
+test('anchor_prune keeps anchor lines from the middle', () => {
+  const anchor = 'src/core/proxy.ts';
+  const text = makeLineyAnchorText(200, anchor);
+  const out = rtk.anchor_prune(text, [anchor]);
+  assert.ok(out.length < text.length);
+  assert.ok(out.includes(anchor));
+  assert.ok(out.includes('anchor-matched lines'));
+});
+
+test('extract_compress_anchors picks user anchors', () => {
+  const anchors = rtk.extract_compress_anchors({
+    messages: [
+      { role: 'assistant', content: 'ignore this assistant noise' },
+      { role: 'user', content: 'Fix `proxy.ts` in src/core/proxy.ts, TypeError, line 42' },
+    ],
+  });
+  assert.ok(anchors.includes('proxy.ts'));
+  assert.ok(anchors.includes('src/core/proxy.ts'));
+  assert.ok(anchors.includes('typeerror'));
+  assert.ok(anchors.includes('line 42'));
+});
+
+test('auto_detect_filter prefers anchor pruning when anchors are present', () => {
+  const anchor = 'src/core/proxy.ts';
+  const text = makeLineyAnchorText(200, anchor);
+  const fn = rtk.auto_detect_filter(text, [anchor]);
+  assert.ok(fn !== null);
+  assert.strictEqual(fn!.name, 'anchor-prune');
+  const out = fn!(text);
+  assert.ok(out.length < text.length);
+  assert.ok(out.includes(anchor));
+});
+
+test('repeat cache replaces repeated large tool output', () => {
+  rtk.reset_repeat_cache();
+  const text = 'z'.repeat(10000);
+  const firstStats: any = { bytesBefore: 0, bytesAfter: 0, hits: [] };
+  const secondStats: any = { bytesBefore: 0, bytesAfter: 0, hits: [] };
+  const first = rtk.compress_text(text, firstStats);
+  const second = rtk.compress_text(text, secondStats);
+  assert.ok(first.includes('tool result middle pruned'));
+  assert.ok(second.includes('NoBleed repeat cache hit'));
+  assert.ok(second.length < first.length);
+  assert.ok(secondStats.hits.some((h: any) => h.filter === 'repeat-cache'));
+  rtk.reset_repeat_cache();
+});
+
+test('compress_messages uses extracted anchors end to end', () => {
+  rtk.reset_repeat_cache();
+  const anchor = 'src/core/proxy.ts';
+  const tool = makeLineyAnchorText(200, anchor);
+  const body: any = {
+    messages: [
+      { role: 'user', content: `Fix ${anchor}` },
+      { role: 'tool', content: tool },
+    ],
+  };
+  const anchors = rtk.extract_compress_anchors(body);
+  const stats = rtk.compress_messages(body, true, anchors);
+  assert.ok(stats);
+  assert.ok(typeof body.messages[1].content === 'string');
+  assert.ok(body.messages[1].content.includes(anchor));
+  assert.ok(body.messages[1].content.length < tool.length);
+  rtk.reset_repeat_cache();
+});

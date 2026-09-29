@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { CompressStats, FilterFn, RequestBody } from '../types.js';
 import { spillIfNeeded as _spillIfNeeded, DEFAULT_SPILL_CONFIG as _SPILL_CONFIG } from '../spill.js';
 
@@ -33,6 +34,153 @@ export const TOOL_RESULT_PRUNE_THRESHOLD = 8192;
 export const TOOL_RESULT_PRUNE_HEAD = 4096;
 export const TOOL_RESULT_PRUNE_TAIL = 1024;
 export const TOOL_RESULT_PRUNE_MARKER = '\n\n[... tool result middle pruned ...]\n\n';
+
+export const REPEAT_CACHE_MIN_CHARS = 8192;
+const REPEAT_CACHE_MAX_ENTRIES = 512;
+let _repeatCacheEnabled = true;
+const _repeatCache = new Map<string, { size: number; count: number }>();
+
+export function set_repeat_cache(enabled: boolean): void {
+  _repeatCacheEnabled = !!enabled;
+}
+
+export function reset_repeat_cache(): void {
+  _repeatCache.clear();
+}
+
+const ANCHOR_STOPWORDS = new Set([
+  'the', 'and', 'for', 'with', 'from', 'into', 'onto', 'line', 'lines', 'file', 'files', 'function', 'functions', 'test', 'tests', 'error', 'errors', 'bug', 'bugs', 'output', 'input', 'request', 'requests', 'response', 'token', 'tokens', 'model', 'models', 'provider', 'code', 'app', 'apps', 'this', 'that', 'when', 'where', 'which', 'while', 'using', 'used', 'use', 'there', 'here', 'what', 'why', 'how', 'can', 'could', 'should', 'would', 'will', 'please', 'make', 'made', 'adding', 'added', 'add', 'fix', 'fixed', 'find', 'found', 'help', 'want', 'need', 'needs', 'get', 'got', 'run', 'runs', 'running', 'start', 'stop', 'page', 'pages', 'name', 'names', 'value', 'values', 'type', 'types', 'list', 'lists', 'show', 'shown', 'display', 'read', 'write', 'written', 'delete', 'deleted', 'remove', 'removed', 'update', 'updated', 'change', 'changed', 'implement', 'implemented', 'feature', 'features', 'option', 'options', 'setting', 'settings', 'config', 'configs', 'configuration', 'tool', 'tools', 'command', 'commands', 'path', 'paths', 'dir', 'dirs', 'directory', 'directories', 'project', 'projects', 'main', 'src', 'core', 'cli', 'tui', 'test', 'tests'
+]);
+const RE_ANCHOR_PATH = /(?:[A-Za-z]:[\\/]|[./]{1,2})?[A-Za-z0-9_\-]+(?:[./][A-Za-z0-9_\-]+)+\.[A-Za-z0-9]{1,8}/g;
+const RE_ANCHOR_BACKTICK = /`([^`\n]{2,80})`/g;
+const RE_ANCHOR_QUOTED = /["']([^"'\n]{3,80})["']/g;
+const RE_ANCHOR_ERROR = /\b[A-Z][A-Za-z0-9]*(?:Error|Exception|Failure|Warning)\b/g;
+const RE_ANCHOR_IDENTIFIER = /\b(?:[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+|[A-Z][A-Z0-9_]{2,}|_?[a-z0-9]+(?:_[a-z0-9]+)+|__\w+__|[a-z]+[A-Z][A-Za-z0-9]+)\b/g;
+const RE_ANCHOR_LINE = /\bline\s+(\d{1,6})\b/gi;
+const RE_ANCHOR_COMMAND = /\b(?:npm|pnpm|yarn|bun|deno|node|python|pytest|jest|vitest|go|cargo|make|git|docker|kubectl)\s+[a-z][a-z0-9:.\-]*(?:\s+[a-z0-9:.\-\/=]+){0,3}\b/g;
+const RE_ANCHOR_URL = /\bhttps?:\/\/[^\s"'`<>]{3,80}/g;
+
+function _normalizeAnchor(value: string): string | null {
+  let t = value.trim().toLowerCase();
+  t = t.replace(/[.,;:!?]+$/g, '');
+  if (t.length < 3 || t.length > 80) return null;
+  if (ANCHOR_STOPWORDS.has(t)) return null;
+  if (/^line \d+$/.test(t)) return t;
+  if (/^[a-z]+(?: [a-z0-9:.\-\/=]+){0,3}$/.test(t)) return t;
+  if (!/^[\w@.:/?&=\\-]+$/.test(t)) return null;
+  return t;
+}
+
+export function extract_compress_anchors(body: RequestBody): string[] {
+  if (!body) return [];
+  const userTexts: string[] = [];
+  const addText = (v: unknown): void => {
+    if (typeof v === 'string' && v.trim()) userTexts.push(v);
+  };
+  const addMessage = (m: any): void => {
+    if (!m || typeof m !== 'object') return;
+    if (m.role && m.role !== 'user') return;
+    if (typeof m.content === 'string') addText(m.content);
+    else if (Array.isArray(m.content)) {
+      for (const p of m.content) {
+        if (p && typeof p === 'object' && p.type === 'text' && typeof p.text === 'string') addText(p.text);
+      }
+    }
+    const nested = m.userInputMessage?.userInputMessage;
+    if (nested && typeof nested === 'object') {
+      if (typeof nested.text === 'string') addText(nested.text);
+      if (typeof nested.content === 'string') addText(nested.content);
+    }
+  };
+  if (Array.isArray(body.messages)) for (const m of body.messages) addMessage(m);
+  if (Array.isArray(body.input)) for (const m of body.input) addMessage(m);
+  const state = body.conversationState;
+  if (state && typeof state === 'object') {
+    if (Array.isArray(state.history)) for (const m of state.history) addMessage(m);
+    if (state.currentMessage) addMessage(state.currentMessage);
+  }
+
+  const out = new Set<string>();
+  for (const raw of userTexts.reverse()) {
+    const clean = _strip_ansi(raw);
+    for (const m of clean.matchAll(RE_ANCHOR_PATH)) {
+      const n = _normalizeAnchor(m[0]);
+      if (n) out.add(n);
+    }
+    for (const m of clean.matchAll(RE_ANCHOR_BACKTICK)) {
+      const n = _normalizeAnchor(m[1]);
+      if (n) out.add(n);
+    }
+    for (const m of clean.matchAll(RE_ANCHOR_QUOTED)) {
+      const n = _normalizeAnchor(m[1]);
+      if (n) out.add(n);
+    }
+    for (const m of clean.matchAll(RE_ANCHOR_ERROR)) {
+      const n = _normalizeAnchor(m[0]);
+      if (n) out.add(n);
+    }
+    for (const m of clean.matchAll(RE_ANCHOR_IDENTIFIER)) {
+      const n = _normalizeAnchor(m[0]);
+      if (n) out.add(n);
+    }
+    for (const m of clean.matchAll(RE_ANCHOR_LINE)) {
+      out.add(`line ${m[1]}`);
+    }
+    for (const m of clean.matchAll(RE_ANCHOR_COMMAND)) {
+      const n = _normalizeAnchor(m[0]);
+      if (n) out.add(n);
+    }
+    for (const m of clean.matchAll(RE_ANCHOR_URL)) {
+      const n = _normalizeAnchor(m[0]);
+      if (n) out.add(n);
+    }
+    if (out.size >= 50) break;
+  }
+  return [...out].slice(0, 50);
+}
+
+function _lineMatchesAnchors(line: string, anchors: string[]): boolean {
+  if (!anchors.length) return false;
+  const lower = line.toLowerCase();
+  for (const a of anchors) {
+    if (lower.includes(a)) return true;
+  }
+  return false;
+}
+
+export function anchor_prune(inputText: string, anchors: string[] = []): string {
+  if (!anchors.length || inputText.length <= TOOL_RESULT_PRUNE_THRESHOLD) return inputText;
+  const lines = inputText.split('\n');
+  if (lines.length < SMART_TRUNCATE_MIN_LINES) return inputText;
+  const middleStart = SMART_TRUNCATE_HEAD;
+  const middleEnd = lines.length - SMART_TRUNCATE_TAIL;
+  if (middleEnd <= middleStart) return inputText;
+  const head = lines.slice(0, middleStart);
+  const tail = lines.slice(middleEnd);
+  const kept: string[] = [];
+  let keptCount = 0;
+  const maxAnchorLines = Math.min(300, Math.max(20, Math.floor((middleEnd - middleStart) / 4)));
+  const longCap = _caps.longLineMax;
+  for (let i = middleStart; i < middleEnd; i++) {
+    const line = lines[i];
+    if (!line) continue;
+    if (_lineMatchesAnchors(line, anchors)) {
+      kept.push(longCap > 0 && line.length > longCap ? `${line.slice(0, longCap)}\u2026` : line);
+      keptCount += 1;
+      if (keptCount >= maxAnchorLines) break;
+    }
+  }
+  if (!keptCount) return inputText;
+  const cut = lines.length - head.length - tail.length - keptCount;
+  if (cut <= 0) return inputText;
+  const joined = [
+    ...head,
+    `\n... ${keptCount} anchor-matched lines kept from ${cut + keptCount} middle lines`,
+    ...kept,
+    ...tail,
+  ].join('\n');
+  return joined.length < inputText.length ? joined : inputText;
+}
 
 export const TEST_FAILURES_MAX = 8;
 export const TEST_ERR_LINES_MAX = 3;
@@ -1061,7 +1209,7 @@ function tool_result_prune(text: string): string {
   return head + TOOL_RESULT_PRUNE_MARKER + tail;
 }
 
-export function auto_detect_filter(text: string): FilterFn | null {
+export function auto_detect_filter(text: string, anchors: string[] = []): FilterFn | null {
   const head = text.length > DETECT_WINDOW ? text.slice(0, DETECT_WINDOW) : text;
   const headClean = _strip_ansi(head);
 
@@ -1092,6 +1240,17 @@ export function auto_detect_filter(text: string): FilterFn | null {
   if (RE_LS_TOTAL.test(head) || _count_matches(head, RE_LS_ROW) >= 3) return ls;
 
   if (RE_SEARCH_LIST_HEADER.test(head)) return search_list;
+
+  if (
+    anchors.length > 0 &&
+    text.length > TOOL_RESULT_PRUNE_THRESHOLD &&
+    text.split('\n').length >= SMART_TRUNCATE_MIN_LINES
+  ) {
+    const anchorFilter: FilterFn = Object.defineProperty((t: string) => anchor_prune(t, anchors), 'name', {
+      value: 'anchor-prune',
+    });
+    return anchorFilter;
+  }
 
   if (lines.length >= SMART_TRUNCATE_MIN_LINES && _is_line_numbered(lines)) return read_numbered;
 
@@ -1176,13 +1335,41 @@ export function safe_apply(fn: FilterFn | null, text: string): string {
   }
 }
 
-export function compress_text(text: string, stats: CompressStats): string {
+function cacheRepeated(clean: string, stats: CompressStats): string | null {
+  if (!_repeatCacheEnabled || clean.length < REPEAT_CACHE_MIN_CHARS) return null;
+  let hash = '';
+  try {
+    hash = createHash('sha256').update(clean).digest('hex').slice(0, 16);
+  } catch {
+    return null;
+  }
+  const rec = _repeatCache.get(hash);
+  if (!rec) {
+    if (_repeatCache.size >= REPEAT_CACHE_MAX_ENTRIES) {
+      const first = _repeatCache.keys().next();
+      if (!first.done) _repeatCache.delete(first.value);
+    }
+    _repeatCache.set(hash, { size: clean.length, count: 1 });
+    return null;
+  }
+  rec.count += 1;
+  return `[NoBleed repeat cache hit ${hash} occurrence=${rec.count} original_chars=${rec.size}]`;
+}
+
+export function compress_text(text: string, stats: CompressStats, anchors: string[] = []): string {
   const bytesIn = text.length;
   stats.bytesBefore += bytesIn;
   if (bytesIn === 0) return text;
 
   const clean = _strip_ansi(text);
   const ansiSaved = bytesIn - clean.length;
+
+  const cached = cacheRepeated(clean, stats);
+  if (cached) {
+    stats.bytesAfter += cached.length;
+    stats.hits.push({ shape: 'repeat', filter: 'repeat-cache', saved: bytesIn - cached.length });
+    return cached;
+  }
 
   const spillCandidate = (out: string, outLen: number, shape: string, filter: string): string => {
     if (outLen < bytesIn) {
@@ -1196,7 +1383,7 @@ export function compress_text(text: string, stats: CompressStats): string {
   if (bytesIn > RAW_CAP) return _spill_or_pass(text, clean, ansiSaved, stats);
   if (clean.length < MIN_COMPRESS_SIZE) return spillCandidate(clean, clean.length, 'ansi', '_strip_ansi');
 
-  const fn = auto_detect_filter(clean);
+  const fn = auto_detect_filter(clean, anchors);
   if (fn === null) return _spill_or_pass(text, clean, ansiSaved, stats);
 
   const out = safe_apply(fn, clean);
@@ -1222,7 +1409,7 @@ function _spill_or_pass(text: string, clean: string, ansiSaved: number, stats: C
   return text;
 }
 
-function _compress_kiro(body: RequestBody): CompressStats | null {
+function _compress_kiro(body: RequestBody, anchors: string[] = []): CompressStats | null {
   const stats: CompressStats = { bytesBefore: 0, bytesAfter: 0, hits: [] };
   try {
     const state = body.conversationState || {};
@@ -1240,7 +1427,7 @@ function _compress_kiro(body: RequestBody): CompressStats | null {
         if (!Array.isArray(content)) continue;
         for (const part of content) {
           if (part && typeof part === 'object' && typeof part.text === 'string') {
-            part.text = compress_text(part.text, stats);
+            part.text = compress_text(part.text, stats, anchors);
           }
         }
       }
@@ -1252,11 +1439,11 @@ function _compress_kiro(body: RequestBody): CompressStats | null {
   return stats;
 }
 
-export function compress_messages(body: RequestBody, enabled = true): CompressStats | null {
+export function compress_messages(body: RequestBody, enabled = true, anchors: string[] = []): CompressStats | null {
   if (!enabled) return null;
   if (!body) return null;
 
-  if ('conversationState' in body) return _compress_kiro(body);
+  if ('conversationState' in body) return _compress_kiro(body, anchors);
 
   let items: any[] | null = null;
   if (Array.isArray(body.messages)) items = body.messages;
@@ -1271,11 +1458,11 @@ export function compress_messages(body: RequestBody, enabled = true): CompressSt
 
       if (msg.type === 'function_call_output') {
         if (typeof msg.output === 'string') {
-          msg.output = compress_text(msg.output, stats);
+          msg.output = compress_text(msg.output, stats, anchors);
         } else if (Array.isArray(msg.output)) {
           for (const part of msg.output) {
             if (part && typeof part === 'object' && part.type === 'input_text' && typeof part.text === 'string') {
-              part.text = compress_text(part.text, stats);
+              part.text = compress_text(part.text, stats, anchors);
             }
           }
         }
@@ -1283,7 +1470,7 @@ export function compress_messages(body: RequestBody, enabled = true): CompressSt
       }
 
       if (msg.role === 'tool' && typeof msg.content === 'string') {
-        msg.content = compress_text(msg.content, stats);
+        msg.content = compress_text(msg.content, stats, anchors);
         continue;
       }
 
@@ -1293,7 +1480,7 @@ export function compress_messages(body: RequestBody, enabled = true): CompressSt
       if (msg.role === 'tool') {
         for (const part of content) {
           if (part && typeof part === 'object' && part.type === 'text' && typeof part.text === 'string') {
-            part.text = compress_text(part.text, stats);
+            part.text = compress_text(part.text, stats, anchors);
           }
         }
         continue;
@@ -1304,11 +1491,11 @@ export function compress_messages(body: RequestBody, enabled = true): CompressSt
         if (block.is_error) continue;
 
         if (typeof block.content === 'string') {
-          block.content = compress_text(block.content, stats);
+          block.content = compress_text(block.content, stats, anchors);
         } else if (Array.isArray(block.content)) {
           for (const part of block.content) {
             if (part && typeof part === 'object' && part.type === 'text' && typeof part.text === 'string') {
-              part.text = compress_text(part.text, stats);
+              part.text = compress_text(part.text, stats, anchors);
             }
           }
         }

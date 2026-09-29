@@ -132,6 +132,60 @@ test('saver policy reads defaults and persists', () => {
   assert.strictEqual(saved.daily_budget_usd, 2.5);
 });
 
+test('model_total_cost treats unknown pricing as infinite', () => {
+  assert.strictEqual(models.model_total_cost({} as any), Infinity);
+});
+
+test('choose_saver_models puts unknown pricing after known pricing', () => {
+  const unknown: any = {
+    id: 'test/unknown',
+    provider: 'test',
+    name: 'Unknown',
+    is_free: false,
+    tool_call: true,
+    reasoning: false,
+    context: 100000,
+  };
+  const paid: any = {
+    id: 'test/paid',
+    provider: 'test',
+    name: 'Paid',
+    input_price: 1,
+    output_price: 1,
+    is_free: false,
+    tool_call: true,
+    reasoning: false,
+    context: 100000,
+  };
+  const catalog: any = {
+    test: {
+      id: 'test',
+      name: 'Test',
+      configured: true,
+      models: [unknown, paid],
+    },
+  };
+  const r = models.choose_saver_models(catalog, 'paid', 'general', 5);
+  assert.strictEqual(r.error, undefined);
+  assert.strictEqual(r.main.id, 'test/paid');
+});
+
+test('saver policy rejects invalid numbers', () => {
+  const current = models.read_saver_policy();
+  models.write_saver_policy({
+    ...current,
+    mode: 'free',
+    daily_budget_usd: NaN,
+    free_daily_token_limit: Infinity,
+    max_paid_cost_per_million: 'abc' as any,
+  });
+  const p = models.read_saver_policy();
+  assert.strictEqual(p.mode, 'free');
+  assert.strictEqual(Number.isFinite(p.daily_budget_usd), true);
+  assert.strictEqual(Number.isFinite(p.free_daily_token_limit), true);
+  assert.strictEqual(Number.isFinite(p.max_paid_cost_per_million), true);
+});
+
 test('fetchCatalog serves a fresh cache without network', async () => {
   seedCatalog();
   const r = await models.fetchCatalog();

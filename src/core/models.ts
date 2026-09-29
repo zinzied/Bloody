@@ -208,8 +208,43 @@ export function find_model_in_catalog(catalog: ProviderCatalog, modelId: string)
   return null;
 }
 
+function _finiteNumber(value: unknown, fallback: number): number {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+function _sanitize_policy(policy: Partial<SaverPolicy> | null | undefined): SaverPolicy {
+  const defaults: SaverPolicy = {
+    mode: 'paid',
+    daily_budget_usd: 1.0,
+    free_daily_token_limit: 100000,
+    max_paid_cost_per_million: 5.0,
+    last_applied: null,
+  };
+  if (!policy || typeof policy !== 'object') return defaults;
+  return {
+    mode: policy.mode === 'free' ? 'free' : 'paid',
+    daily_budget_usd: _finiteNumber(policy.daily_budget_usd, defaults.daily_budget_usd),
+    free_daily_token_limit: _finiteNumber(policy.free_daily_token_limit, defaults.free_daily_token_limit),
+    max_paid_cost_per_million: _finiteNumber(policy.max_paid_cost_per_million, defaults.max_paid_cost_per_million),
+    last_applied: typeof policy.last_applied === 'string' ? policy.last_applied : null,
+  };
+}
+
+function _compare_model_cost(a: ModelInfo, b: ModelInfo, expensive = false): number {
+  const ac = model_total_cost(a);
+  const bc = model_total_cost(b);
+  const af = Number.isFinite(ac);
+  const bf = Number.isFinite(bc);
+  if (!af && !bf) return 0;
+  if (!af) return 1;
+  if (!bf) return -1;
+  if (ac === bc) return 0;
+  return expensive ? bc - ac : ac - bc;
+}
+
 export function model_total_cost(model: ModelInfo | null | undefined): number {
-  if (!model) return NaN;
+  if (!model) return Infinity;
   const anyModel = model as any;
   const ip = typeof anyModel.input_price === 'number' ? anyModel.input_price : NaN;
   const op = typeof anyModel.output_price === 'number' ? anyModel.output_price : NaN;
@@ -219,30 +254,26 @@ export function model_total_cost(model: ModelInfo | null | undefined): number {
     : (anyModel.pricing && typeof anyModel.pricing === 'object' ? anyModel.pricing : {});
   const i = Number(c.input);
   const o = Number(c.output);
-  return Number.isFinite(i) && Number.isFinite(o) ? i + o : NaN;
+  return Number.isFinite(i) && Number.isFinite(o) ? i + o : Infinity;
 }
 
 export function read_saver_policy(): SaverPolicy {
-  const defaults: SaverPolicy = {
-    mode: 'paid',
-    daily_budget_usd: 1.0,
-    free_daily_token_limit: 100000,
-    max_paid_cost_per_million: 5.0,
-    last_applied: null,
-  };
+  const defaults: SaverPolicy = _sanitize_policy({});
   if (fs.existsSync(config.SAVER_POLICY_PATH)) {
     try {
       const saved = JSON.parse(fs.readFileSync(config.SAVER_POLICY_PATH, 'utf-8'));
-      return { ...defaults, ...saved };
+      return _sanitize_policy({ ...defaults, ...saved });
     } catch {}
   }
   return defaults;
 }
 
-export function write_saver_policy(policy: SaverPolicy): void {
+export function write_saver_policy(policy: SaverPolicy): SaverPolicy {
+  const safe = _sanitize_policy(policy);
   const dir = path.dirname(config.SAVER_POLICY_PATH);
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(config.SAVER_POLICY_PATH, JSON.stringify(policy, null, 2), 'utf-8');
+  fs.writeFileSync(config.SAVER_POLICY_PATH, JSON.stringify(safe, null, 2), 'utf-8');
+  return safe;
 }
 
 export function normalize_provider_filter(provider: string | null | undefined): string | null {
@@ -295,7 +326,7 @@ export function choose_saver_models(
     return { error: msg } as unknown as ChosenSaverModels;
   }
 
-  configured.sort((a, b) => model_total_cost(a) - model_total_cost(b));
+  configured.sort((a, b) => _compare_model_cost(a, b));
   const freeModels = configured.filter((m) => m.is_free);
   const paidAllowed = configured.filter((m) => !m.is_free && model_total_cost(m) <= maxPaidCost);
   let cheapPool = [...freeModels, ...paidAllowed];
@@ -320,7 +351,8 @@ export function choose_saver_models(
     const ka = freeFirst && !a.is_free ? 1 : 0;
     const kb = freeFirst && !b.is_free ? 1 : 0;
     if (ka !== kb) return ka - kb;
-    if (model_total_cost(a) !== model_total_cost(b)) return model_total_cost(a) - model_total_cost(b);
+    const cmp = _compare_model_cost(a, b);
+    if (cmp !== 0) return cmp;
     return Number(b.context || 0) - Number(a.context || 0);
   });
   const mainModel = candidatePool[0];
@@ -332,7 +364,7 @@ export function choose_saver_models(
     const ka = freeFirst && !a.is_free ? 1 : 0;
     const kb = freeFirst && !b.is_free ? 1 : 0;
     if (ka !== kb) return ka - kb;
-    return model_total_cost(a) - model_total_cost(b);
+    return _compare_model_cost(a, b);
   });
   const smallModel = smallPool[0];
 
@@ -342,7 +374,7 @@ export function choose_saver_models(
     const ka = freeFirst && !a.is_free ? 1 : 0;
     const kb = freeFirst && !b.is_free ? 1 : 0;
     if (ka !== kb) return ka - kb;
-    return model_total_cost(a) - model_total_cost(b);
+    return _compare_model_cost(a, b);
   });
   const fallbacks = fallbackPool.slice(0, 3).map((m) => m.id);
 
@@ -362,18 +394,19 @@ export function recommend_models(catalog: ProviderCatalog, task: string) {
     if (pd.configured) configured.push(...(pd.models || []));
   }
   if (!configured.length) return { configured: false, items: [] };
+  const cheapestFirst = [...configured].sort((a, b) => _compare_model_cost(a, b));
   const templates = TASK_TEMPLATES[task] || TASK_TEMPLATES.coding;
   const items: { tag: string; desc: string; model: ModelInfo }[] = [];
   const seen = new Set<string>();
   for (const tpl of templates) {
     let candidates: ModelInfo[];
     if (tpl.weight === -1) {
-      candidates = [...configured].sort((a, b) => -(model_total_cost(a) - model_total_cost(b)));
+      candidates = [...cheapestFirst].reverse();
     } else if (tpl.weight === 1) {
-      const mid = Math.floor(configured.length / 2);
-      candidates = configured.slice(mid);
+      const mid = Math.floor(cheapestFirst.length / 2);
+      candidates = cheapestFirst.slice(mid);
     } else {
-      candidates = [...configured].sort((a, b) => model_total_cost(a) - model_total_cost(b));
+      candidates = cheapestFirst;
     }
     for (const m of candidates) {
       if (!seen.has(m.id)) {

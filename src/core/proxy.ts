@@ -1048,7 +1048,7 @@ function recordHistory(
     let costUSD = 0;
     try {
       costUSD = budget.estimateCostForRequest(rawTokens, outTokens, modelId);
-      budget.recordDailySpend({ cost: costUSD, tokensIn: rawTokens, tokensOut: outTokens, tokens: rawTokens });
+      budget.recordDailySpend({ cost: costUSD, tokensIn: rawTokens, tokensOut: outTokens, tokens: rawTokens + outTokens });
     } catch {}
     return { rawTokens, outTokens, costUSD };
   } catch {
@@ -1453,7 +1453,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     let stats: CompressStats | null = null;
     const forceRewrite = budgetEnforced || !!rateLimitReroutedFrom || !!appliedStyle || mapTokens !== null;
     if (data) {
-      const compressed = rtk.compress_messages(data, true);
+      const compressed = rtk.compress_messages(data, true, rtk.extract_compress_anchors(data));
       if (compressed) {
         const serialized = JSON.stringify(data);
         if (forceRewrite || serialized.length < raw.length) {
