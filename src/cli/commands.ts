@@ -717,7 +717,9 @@ function cmdTokens(args: string[]): number {
     case 'count_tokens': {
       const text = positionals.slice(1).join(' ');
       if (!text) { outErr('usage: tokens count <text>'); return 1; }
-      const accurate = tokens.count_tokens(text);
+      // Exact, not the bounded request-path count: the user asked for a real
+      // number here and there is no latency budget to protect.
+      const accurate = tokens.count_tokens_exact(text);
       const heuristic = tokens.estimate_text_tokens(text);
       out(`Text length: ${fmt(text.length)} chars`);
       out(`Accurate (tiktoken ${tokens.tokenizerInfo().encoding}): ${fmt(accurate)} tokens`);
@@ -731,7 +733,7 @@ function cmdTokens(args: string[]): number {
       let body: Record<string, unknown>;
       try { body = JSON.parse(raw); } catch { outErr('invalid JSON'); return 1; }
       const heuristic = tokens.estimate_request_tokens(body as never);
-      const accurate = tokens.estimate_request_tokens_accurate(body as never);
+      const accurate = tokens.count_tokens_exact(JSON.stringify(body));
       out(`Heuristic: ${fmt(heuristic)} tok`);
       out(`Accurate (${tokens.tokenizerInfo().encoding}): ${fmt(accurate)} tok`);
       out(`Saved vs heuristic: ${fmt(heuristic - accurate)} tok`);

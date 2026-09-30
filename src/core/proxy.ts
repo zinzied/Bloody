@@ -1093,6 +1093,26 @@ function forward(
     return headers;
   }
 
+  // Bookkeeping, not part of the response. Token counting, the SQLite ledger
+  // insert and the JSON writes are all synchronous, and running them inline
+  // blocked the event loop while an SSE stream was mid-flight — so a client
+  // watching tokens arrive saw them stall for as long as the accounting took.
+  // Deferred by one turn so the stream drains first. Guarded because the
+  // response callback and the socket error handler can both reach this, and a
+  // request must only ever be counted once.
+  let settled = false;
+  function settle(statusCode: number, upRes: http.IncomingMessage | null, style: AppliedStyle | null): void {
+    if (settled) return;
+    settled = true;
+    setImmediate(() => {
+      let usage: RequestUsage | null = null;
+      try {
+        usage = recordHistory(pathOnly, modelId, stats, upstreamUrl, rawBody, outBody, style, mapTokens);
+      } catch {}
+      finish(statusCode, upRes, usage);
+    });
+  }
+
   function finish(statusCode: number, upRes: http.IncomingMessage | null, usage: RequestUsage | null = null): void {
     // The provider we resolved, not one split off the model string: for a bare
     // model id (`big-pickle`) that split yields the model's own name, and the
@@ -1190,8 +1210,7 @@ function forward(
             { method: 'POST', headers: { ...pick(), 'Content-Length': String(Buffer.byteLength(rawBody)) } },
             (res2) => {
               streamBack(res2, res);
-              const usage = recordHistory(pathOnly, modelId, stats, upstreamUrl, rawBody, outBody, null, mapTokens);
-              finish(res2.statusCode || 0, res2, usage);
+              settle(res2.statusCode || 0, res2, null);
             }
           );
           retryReq.on('error', () => {
@@ -1206,12 +1225,16 @@ function forward(
           return;
         }
         streamBack(upRes, res);
-        const usage = recordHistory(pathOnly, modelId, stats, upstreamUrl, rawBody, outBody, style, mapTokens);
-        finish(upRes.statusCode || 0, upRes, usage);
+        settle(upRes.statusCode || 0, upRes, style);
       }
     );
     upReq.on('error', () => {
-      finish(0, null);
+      // No response to account for, but the failure still has to be recorded so
+      // the account backs off and the provider's quota reflects the error.
+      if (!settled) {
+        settled = true;
+        setImmediate(() => finish(0, null));
+      }
       try {
         respondJson(res, 502, {
           error: { message: 'Proxy upstream failed', type: 'proxy_error', code: 'upstream_failed', upstream: upstreamUrl },

@@ -72,6 +72,43 @@ test('get_user_models_sync marks env-configured providers and sorts by price', (
   assert.strictEqual(mini!.tool_call, true);
 });
 
+test('the catalog cache returns one parse but still sees an external refresh', () => {
+  seedCatalog();
+  models.invalidateCatalogCache();
+
+  // Same object across calls: the proxy reads this on the request path, and the
+  // file is megabytes of JSON, so re-parsing it per call cost ~30ms a request.
+  const first = models.readCatalogCache();
+  const second = models.readCatalogCache();
+  assert.strictEqual(first, second, 'an unchanged catalog must not be re-parsed');
+
+  // A rewrite on disk has to invalidate, or the proxy would serve stale pricing.
+  const updated = { ...CATALOG, marker: { name: 'Marker', models: { m1: { name: 'M1', cost: { input: 1, output: 2 } } } } };
+  fs.writeFileSync(config.CACHE_PATH, JSON.stringify(updated), 'utf-8');
+  // Ensure the mtime actually moves on filesystems with coarse timestamps.
+  const future = new Date(Date.now() + 2000);
+  fs.utimesSync(config.CACHE_PATH, future, future);
+
+  const third = models.readCatalogCache();
+  assert.notStrictEqual(third, first, 'a changed catalog must be re-read');
+  assert.ok(third && third.marker, 'the refreshed catalog must be visible');
+});
+
+test('the projected catalog is reused but rebuilt when its inputs change', () => {
+  seedCatalog();
+  models.invalidateCatalogCache();
+  const a = models.get_user_models_sync();
+  const b = models.get_user_models_sync();
+  assert.strictEqual(a, b, 'an unchanged projection must be reused');
+
+  const future = new Date(Date.now() + 3000);
+  fs.writeFileSync(config.CACHE_PATH, JSON.stringify(CATALOG), 'utf-8');
+  fs.utimesSync(config.CACHE_PATH, future, future);
+  const c = models.get_user_models_sync();
+  assert.notStrictEqual(c, a, 'a changed catalog must invalidate the projection');
+  assert.ok(c['openai (OpenAI)'], 'the rebuilt projection must still carry its models');
+});
+
 test('choose_saver_models picks cheapest tool-capable main with fallbacks', () => {
   const um = models.get_user_models_sync();
   const r = models.choose_saver_models(um, 'paid', 'coding', 5.0);

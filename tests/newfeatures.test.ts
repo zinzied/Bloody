@@ -45,6 +45,68 @@ test('estimate_text_tokens calculates tokens', () => {
   assert.strictEqual(tokens.estimate_text_tokens(''.padEnd(100, 'a')), 25);
 });
 
+// js-tiktoken's regex splitter is O(n²) on low-entropy text, so counting one of
+// these exactly took minutes and froze the proxy's event loop. These assert the
+// bound holds rather than pinning a wall-clock number, which would be flaky.
+const PATHOLOGICAL = {
+  'whitespace and newlines': '    \n'.repeat(40000),
+  tabs: '\t\t'.repeat(50000),
+  'a single repeated run': 'x'.repeat(400).repeat(500),
+  spaces: ' '.repeat(200000),
+};
+
+test('count_tokens stays fast on low-entropy text that used to hang', () => {
+  // Warm the tokenizer first: this asserts the steady-state cost, not JIT.
+  tokens.count_tokens('const x = compute(1, options);');
+  for (const [name, text] of Object.entries(PATHOLOGICAL)) {
+    const started = Date.now();
+    const n = tokens.count_tokens(text);
+    const elapsed = Date.now() - started;
+    assert.ok(Number.isFinite(n) && n > 0, `${name} must produce a real count`);
+    assert.ok(elapsed < 1000, `${name} took ${elapsed}ms, expected well under 1000ms`);
+  }
+});
+
+test('count_tokens stays fast on a request-sized body of low-entropy text', () => {
+  tokens.count_tokens('warm up the tokenizer');
+  const body = {
+    model: 'gpt-4o',
+    messages: Array.from({ length: 120 }, (_, i) => ({
+      role: i % 2 ? 'assistant' : 'user',
+      content: i % 3 === 0 ? '    \n'.repeat(40000) : 'please refactor the proxy module',
+    })),
+  };
+  const started = Date.now();
+  tokens.estimate_request_tokens_accurate(body as never);
+  assert.ok(Date.now() - started < 1000, 'a request-sized estimate must not stall the loop');
+});
+
+test('a request estimate stays accurate on low-entropy text', () => {
+  // Extrapolation measures this body's own density, so the bounded count has to
+  // land near the true one rather than near the heuristic's guess. The reference
+  // is the same sum with no budget: per-message text plus the role overhead.
+  // Kept small because the exact reference is itself slow on this shape.
+  const content = '    \n'.repeat(600);
+  const n = 6;
+  const body = { messages: Array.from({ length: n }, () => ({ role: 'user', content })) };
+  const bounded = tokens.estimate_request_tokens_accurate(body as never);
+  const exact = n * (tokens.count_tokens_exact(content) + tokens.ROLE_OVERHEAD);
+  const err = Math.abs(bounded - exact) / exact;
+  assert.ok(err < 0.15, `bounded ${bounded} vs exact ${exact} is ${(err * 100).toFixed(1)}% off`);
+});
+
+test('count_tokens is exact for short strings and never over-reports a floor', () => {
+  for (const text of ['hello world', 'const x = 1;', 'a'.repeat(1000), ' '.repeat(900)]) {
+    assert.strictEqual(tokens.count_tokens(text), tokens.count_tokens_exact(text), JSON.stringify(text.slice(0, 20)));
+  }
+  // Dense-at-the-end text must not be waved through to an unbounded encode.
+  const denseTail = 'export const value = compute(1, options);\n'.repeat(200) + '    \n'.repeat(20000);
+  const started = Date.now();
+  const n = tokens.count_tokens(denseTail);
+  assert.ok(Date.now() - started < 1000, 'a cheap head must not excuse an unbounded tail');
+  assert.ok(n > 0);
+});
+
 test('estimate_message_tokens includes role overhead', () => {
   const result = tokens.estimate_message_tokens({ role: 'user', content: 'hello' });
   assert.ok(result > tokens.estimate_text_tokens('hello'));
