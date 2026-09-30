@@ -395,3 +395,113 @@ test('compress_messages uses extracted anchors end to end', () => {
   assert.ok(body.messages[1].content.length < tool.length);
   rtk.reset_repeat_cache();
 });
+
+test('the token estimator counts Anthropic tool_result content it used to skip', () => {
+  // The compressor rewrites tool_result payloads, so the savings have to be
+  // counted. It used to be read from .content rather than .text, which both
+  // estimators skipped — real byte savings reported as zero tokens.
+  const payload = Array.from({ length: 300 }, (_, i) => `  src/core/file${i % 5}.ts:${100 + i}  const v${i} = compute(${i});`).join('\n');
+  const body: any = {
+    messages: [
+      { role: 'user', content: 'find it' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'grep', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: payload }] },
+    ],
+  };
+
+  const counted = tokens.estimate_request_tokens_accurate(body);
+  // The payload is the bulk of the body, so a count that ignores it lands far
+  // below what the payload alone is worth. Compared against the payload's own
+  // count rather than a chars-per-token guess, since dense code runs ~0.29
+  // tokens per character.
+  const payloadTokens = tokens.count_tokens(payload);
+  assert.ok(
+    counted > payloadTokens * 0.8,
+    `tool_result payload worth ${payloadTokens} tokens counted as only ${counted}`
+  );
+
+  // And it has to respond to the payload shrinking, which is the whole point.
+  const before = tokens.estimate_request_tokens_accurate(JSON.parse(JSON.stringify(body)));
+  body.messages[2].content[0].content = 'src/core/proxy.ts:123  match';
+  const after = tokens.estimate_request_tokens_accurate(body);
+  assert.ok(after < before / 2, `shrinking the payload must shrink the count (${before} -> ${after})`);
+});
+
+test('the request shape summary marks what the compressor can actually shrink', () => {
+  const body: any = {
+    messages: [
+      { role: 'user', content: 'go' },
+      { role: 'assistant', content: 'a'.repeat(2000) },
+      { role: 'tool', tool_call_id: 'c1', content: 'b'.repeat(4000) },
+      { role: 'tool', tool_call_id: 'c2', content: 'c'.repeat(4000) },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'd'.repeat(1000) }] },
+    ],
+  };
+  const shape = rtk.summarize_body_shapes(body);
+  assert.match(shape, /tool\* .*×2/, `tool messages are compressible and counted: ${shape}`);
+  assert.match(shape, /tool_result\* .*×1/, `tool_result blocks are compressible and counted: ${shape}`);
+  assert.match(shape, /assistant .*×1/, `assistant text is reported as not compressible: ${shape}`);
+  assert.match(shape, /user .*×2/, `user text is reported as not compressible: ${shape}`);
+  assert.ok(!/assistant\*/.test(shape), 'assistant must not be marked compressible');
+
+  // Sizes only — the summary must never carry content.
+  assert.ok(!shape.includes('aaaa'), 'no content leaks into the summary');
+});
+
+test('a body with no tool messages has nothing to compress, and says so', () => {
+  const body: any = {
+    messages: [
+      { role: 'user', content: 'x'.repeat(6000) },
+      { role: 'assistant', content: 'y'.repeat(6000) },
+    ],
+  };
+  const copy = JSON.parse(JSON.stringify(body));
+  const stats = rtk.compress_messages(copy, true, rtk.extract_compress_anchors(copy));
+  assert.ok(stats);
+  assert.strictEqual(stats.bytesBefore, 0, 'user/assistant text is never rewritten');
+  const shape = rtk.summarize_body_shapes(body);
+  assert.ok(!shape.includes('*'), `nothing here is compressible: ${shape}`);
+});
+
+test('a request estimate stays bounded however large the body gets', () => {
+  // The shared budget is only a bound if it is enforced between calls as well as
+  // within them. Handing each call a shrinking allowance is what stops a hundred
+  // ordinary messages from spending a hundred times the budget between them.
+  const toolOut = Array.from({ length: 400 }, (_, i) => `  src/core/f${i % 9}.ts:${100 + i}  const v${i} = compute(${i}, opts);`).join('\n');
+  const timed = (n: number): number => {
+    const body: any = { messages: Array.from({ length: n }, (_, i) => ({ role: 'tool', tool_call_id: `c${i}`, content: toolOut })) };
+    const started = Date.now();
+    tokens.estimate_request_tokens_accurate(body as never);
+    return Date.now() - started;
+  };
+  timed(3); // warm, so this measures the budget and not the one-time load
+
+  const small = timed(5);
+  const large = timed(40);
+  assert.ok(large < 250, `a 40-message body took ${large}ms`);
+  assert.ok(large < small * 6 + 60, `cost must not scale with the message count (${small}ms -> ${large}ms)`);
+});
+
+test('an enormous low-entropy body cannot stall the estimate', () => {
+  tokens.resetTokenizerForTests();
+  tokens.warmup_tokenizer();
+  // Two million spaces: unbounded this took minutes. The count itself is an
+  // estimate, so all that matters is that it comes back.
+  const body: any = { messages: [{ role: 'tool', tool_call_id: 'x', content: ' '.repeat(2_000_000) }] };
+  const started = Date.now();
+  const n = tokens.estimate_request_tokens_accurate(body as never);
+  const took = Date.now() - started;
+  assert.ok(n > 0, 'a body is not free');
+  assert.ok(took < 1000, `a 2MB whitespace body took ${took}ms`);
+});
+
+test('the tokenizer load is paid at warmup, not by the first request', () => {
+  // Left lazy, building the BPE rank table costs ~270ms and lands on whichever
+  // request the user happens to send first.
+  tokens.resetTokenizerForTests();
+  tokens.warmup_tokenizer();
+  const started = Date.now();
+  tokens.count_tokens('const value = compute(1, options);');
+  const took = Date.now() - started;
+  assert.ok(took < 50, `the first count after warmup took ${took}ms`);
+});

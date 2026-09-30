@@ -265,19 +265,25 @@ export function styleEligible(pathOnly: string, body: RequestBody | null | undef
  * Inject the always-on output style, escalating the level when the request's own
  * context is already large. Returns what was actually injected, or null.
  */
-function applyAlwaysOnStyle(pathOnly: string, body: RequestBody | null | undefined): AppliedStyle | null {
+function applyAlwaysOnStyle(pathOnly: string, body: RequestBody | null | undefined, rawLen: number): AppliedStyle | null {
   if (!_outputStyle || _outputStyle.style === 'off') return null;
   if (!styleEligible(pathOnly, body)) return null;
   try {
-    // Measure the request BEFORE injecting, so the level tracks the real context
-    // the model is already carrying and not our own prompt.
-    let contextTokens = 0;
-    try {
-      contextTokens = tokens.estimate_request_tokens_accurate(body as never);
-    } catch {}
-    const effective = _styleEscalate
-      ? prompts.escalateOutputStyle(_outputStyle, contextTokens, _styleEscalateAt)
-      : _outputStyle;
+    let effective = _outputStyle;
+    if (_styleEscalate) {
+      // Escalation only starts at the lowest threshold, so a body too small to
+      // possibly reach it cannot escalate and does not need measuring. Sizing off
+      // the raw bytes means the check is a number comparison rather than a second
+      // full serialize of the body.
+      const minThreshold = _styleEscalateAt.length > 0 ? _styleEscalateAt[0] : 20000;
+      if (rawLen >= minThreshold * tokens.CHARS_PER_TOKEN) {
+        let contextTokens = 0;
+        try {
+          contextTokens = tokens.estimate_request_tokens_accurate(body as never);
+        } catch {}
+        effective = prompts.escalateOutputStyle(_outputStyle, contextTokens, _styleEscalateAt);
+      }
+    }
     const applied = prompts.apply_output_style(body as RequestBody, effective);
     if (applied) {
       if (!_styleLogged) {
@@ -956,7 +962,7 @@ function readBody(req: http.IncomingMessage, cb: (err: Error | null, body?: stri
   req.on('error', (e: Error) => cb(e));
 }
 
-function streamBack(upRes: http.IncomingMessage, res: http.ServerResponse): void {
+function streamBack(upRes: http.IncomingMessage, res: http.ServerResponse, onFirstByte?: () => void): void {
   const ct = upRes.headers['content-type'] || 'application/json';
   const headers: Record<string, string> = { 'Content-Type': String(ct) };
   if (/text\/event-stream/i.test(String(ct))) {
@@ -964,6 +970,10 @@ function streamBack(upRes: http.IncomingMessage, res: http.ServerResponse): void
     headers['X-Accel-Buffering'] = 'no';
   }
   res.writeHead(upRes.statusCode || 200, headers);
+  // Time to first byte, measured as the first chunk actually arriving from
+  // upstream rather than when the headers showed up — for a streamed reply those
+  // are far apart, and it is the first one a client is waiting on.
+  if (onFirstByte) upRes.once('data', onFirstByte);
   upRes.pipe(res);
 }
 
@@ -971,6 +981,9 @@ interface RecordStats {
   bytesBefore: number;
   bytesAfter: number;
 }
+
+/** Below this a request is never worth a shape explanation, whatever it saved. */
+const SHAPE_LOG_MIN_BYTES = 4 * 1024;
 
 function computeTokenSavings(rawBody: string, outBody: string): { rawTokens: number; outTokens: number; savedTokens: number } {
   let rawTokens: number;
@@ -1000,6 +1013,14 @@ interface RequestUsage {
   costUSD: number;
 }
 
+interface Timing {
+  receivedAt: number;
+  forwardedAt: number;
+  headersAt: number;
+  firstByteAt: number;
+  finishedAt: number;
+}
+
 function recordHistory(
   pathOnly: string,
   modelId: string,
@@ -1008,7 +1029,9 @@ function recordHistory(
   rawBody: string,
   outBody: string,
   style: AppliedStyle | null = null,
-  mapTokens = 0
+  mapTokens = 0,
+  timing?: Timing,
+  bodyShape = ''
 ): RequestUsage | null {
   try {
     const cfg = loadConfig();
@@ -1033,6 +1056,21 @@ function recordHistory(
       output_style: style ? style.label : 'off',
       style_tokens: styleTokens,
       style_escalated: style ? style.escalated : false,
+      body_bytes: Buffer.byteLength(rawBody),
+      sent_bytes: Buffer.byteLength(outBody),
+      body_shape: bodyShape || undefined,
+      ...(timing
+        ? {
+            // Total is measured from the body finishing, not from connection
+            // accept, so it excludes the client's own upload time.
+            duration_ms: Math.max(0, timing.finishedAt - timing.receivedAt),
+            // How long the proxy sat on the body before forwarding — its own CPU
+            // work: parse, style, project map, compression.
+            prep_ms: timing.forwardedAt ? Math.max(0, timing.forwardedAt - timing.receivedAt) : undefined,
+            upstream_ms: timing.headersAt ? Math.max(0, timing.headersAt - timing.forwardedAt) : undefined,
+            ttfb_ms: timing.firstByteAt ? Math.max(0, timing.firstByteAt - timing.receivedAt) : undefined,
+          }
+        : {}),
     });
     saveConfig({
       ...cfg,
@@ -1075,7 +1113,8 @@ function forward(
   upstreamProvider: string,
   style: AppliedStyle | null = null,
   clientKeyUsable = true,
-  mapTokens = 0
+  mapTokens = 0,
+  bodyShape = ''
 ): void {
   const u = new URL(upstreamUrl);
   const transport = u.protocol === 'https:' ? https : http;
@@ -1087,6 +1126,15 @@ function forward(
   let activeKey = credentialKey;
   let keySource = credentialKey ? 'proxy' : clientKey ? 'client' : 'none';
 
+  // Where the wall-clock went. `receivedAt` is stamped by the caller the moment
+  // the body finished reading, so `duration_ms` covers the whole time the proxy
+  // held the request — which is the only number that can be compared against the
+  // client's own stopwatch to tell a slow proxy from a slow model.
+  const receivedAt = (req as http.IncomingMessage & { __nobleedReceivedAt?: number }).__nobleedReceivedAt || Date.now();
+  let forwardedAt = 0;
+  let headersAt = 0;
+  let firstByteAt = 0;
+
   function pick(): Record<string, string> {
     const headers = pickHeaders(req.headers);
     if (activeKey) applyCredential(headers, upstreamProvider, activeKey);
@@ -1097,9 +1145,16 @@ function forward(
   // insert and the JSON writes are all synchronous, and running them inline
   // blocked the event loop while an SSE stream was mid-flight — so a client
   // watching tokens arrive saw them stall for as long as the accounting took.
-  // Deferred by one turn so the stream drains first. Guarded because the
-  // response callback and the socket error handler can both reach this, and a
-  // request must only ever be counted once.
+  //
+  // Deferring by one turn was not enough on its own: at response-header time a
+  // stream has typically barely started, so the accounting still landed in the
+  // middle of it. This waits for the response to finish being read instead, which
+  // is the one point guaranteed to be outside the stream. 'close' is there for the
+  // case that never completes — a client that walks away mid-generation.
+  //
+  // Guarded because the response callback, the socket error handler and the
+  // stream-end handlers can all reach this, and a request must only ever be
+  // counted once.
   let settled = false;
   function settle(statusCode: number, upRes: http.IncomingMessage | null, style: AppliedStyle | null): void {
     if (settled) return;
@@ -1107,10 +1162,40 @@ function forward(
     setImmediate(() => {
       let usage: RequestUsage | null = null;
       try {
-        usage = recordHistory(pathOnly, modelId, stats, upstreamUrl, rawBody, outBody, style, mapTokens);
+        usage = recordHistory(
+          pathOnly,
+          modelId,
+          stats,
+          upstreamUrl,
+          rawBody,
+          outBody,
+          style,
+          mapTokens,
+          {
+            receivedAt: receivedAt,
+            forwardedAt: forwardedAt,
+            headersAt: headersAt,
+            firstByteAt: firstByteAt,
+            finishedAt: Date.now(),
+          },
+          bodyShape
+        );
       } catch {}
       finish(statusCode, upRes, usage);
     });
+  }
+
+  /** Run the accounting once the response is no longer streaming. */
+  function settleWhenStreamDone(upRes: http.IncomingMessage, statusCode: number, style: AppliedStyle | null): void {
+    let done = false;
+    const go = (): void => {
+      if (done) return;
+      done = true;
+      settle(statusCode, upRes, style);
+    };
+    upRes.once('end', go);
+    upRes.once('close', go);
+    upRes.once('error', go);
   }
 
   function finish(statusCode: number, upRes: http.IncomingMessage | null, usage: RequestUsage | null = null): void {
@@ -1175,10 +1260,12 @@ function forward(
   function send(body: string, authRetried = false): void {
     const headers = pick();
     headers['Content-Length'] = String(Buffer.byteLength(body));
+    if (!forwardedAt) forwardedAt = Date.now();
     const upReq = transport.request(
       u,
       { method: 'POST', headers },
       (upRes) => {
+        if (!headersAt) headersAt = Date.now();
         const code = upRes.statusCode || 0;
         // Upstream rejected a credential the proxy picked. If the client sent a
         // different one, that one is the fresh one — use it rather than surfacing
@@ -1209,8 +1296,10 @@ function forward(
             u,
             { method: 'POST', headers: { ...pick(), 'Content-Length': String(Buffer.byteLength(rawBody)) } },
             (res2) => {
-              streamBack(res2, res);
-              settle(res2.statusCode || 0, res2, null);
+              streamBack(res2, res, () => {
+                if (!firstByteAt) firstByteAt = Date.now();
+              });
+              settleWhenStreamDone(res2, res2.statusCode || 0, null);
             }
           );
           retryReq.on('error', () => {
@@ -1224,8 +1313,10 @@ function forward(
           retryReq.end();
           return;
         }
-        streamBack(upRes, res);
-        settle(upRes.statusCode || 0, upRes, style);
+        streamBack(upRes, res, () => {
+          if (!firstByteAt) firstByteAt = Date.now();
+        });
+        settleWhenStreamDone(upRes, upRes.statusCode || 0, style);
       }
     );
     upReq.on('error', () => {
@@ -1314,6 +1405,10 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     try {
       data = JSON.parse(raw);
     } catch {}
+
+    // Start the clock here: the body is in hand, so everything the proxy does
+    // from this point is its own cost and is attributable.
+    (req as http.IncomingMessage & { __nobleedReceivedAt?: number }).__nobleedReceivedAt = Date.now();
 
     let modelId = (data && (data.model || '')) || '';
     // The provider the client meant, before anything is rerouted. A bare model
@@ -1461,7 +1556,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     // Always-on output style (terse replies = fewer output tokens, the expensive
     // ones). Runs on every chat request while the proxy is up, escalating the
     // level once the request's own context is large.
-    const appliedStyle = applyAlwaysOnStyle(pathOnly, data);
+    const appliedStyle = applyAlwaysOnStyle(pathOnly, data, raw.length);
     if (appliedStyle) {
       _metrics.styleApplied += 1;
       if (appliedStyle.escalated) _metrics.styleEscalated += 1;
@@ -1475,6 +1570,11 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     let outBody = raw;
     let stats: CompressStats | null = null;
     const forceRewrite = budgetEnforced || !!rateLimitReroutedFrom || !!appliedStyle || mapTokens !== null;
+    // Sizes only, taken before compression so it describes what the client sent.
+    // A request that saved nothing is ambiguous without this — "nothing worth
+    // shrinking" and "sent in a shape the compressor ignores" look identical in
+    // the saved-bytes column.
+    const bodyShape = data ? rtk.summarize_body_shapes(data) : '';
     if (data) {
       const compressed = rtk.compress_messages(data, true, rtk.extract_compress_anchors(data));
       if (compressed) {
@@ -1494,7 +1594,14 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       }
     }
 
-    forward(req, res, upstreamUrl, outBody, raw, pathOnly, modelId, stats, account, credentialKey, resolved.pid, appliedStyle, !rerouted, mapTokens ?? 0);
+    // Announce the shape only when it explains a zero: a request big enough to be
+    // worth compressing that nonetheless saved nothing. Quiet otherwise, so the
+    // log is not one line per request forever.
+    if (bodyShape && raw.length >= SHAPE_LOG_MIN_BYTES && (!stats || stats.bytesBefore === stats.bytesAfter)) {
+      console.log(`[shape] saved nothing on ${raw.length}B — ${bodyShape} (* = compressible)`);
+    }
+
+    forward(req, res, upstreamUrl, outBody, raw, pathOnly, modelId, stats, account, credentialKey, resolved.pid, appliedStyle, !rerouted, mapTokens ?? 0, bodyShape);
   });
 }
 
@@ -1705,6 +1812,12 @@ export function start(port?: number): Promise<ProxyStatus> {
     // Daily limits never block by default: the user answers "reset" / "stay blocked" from the UI.
     // Set NOBLEED_BUDGET_ENFORCE=0 to hard-disable the guard even after you opted in.
     if (envValue('RATELIMIT_FALLBACK') === undefined) process.env.NOBLEED_RATELIMIT_FALLBACK = '1';
+    // Build the tokenizer's rank table now rather than on the first request. Its
+    // one-time load is ~270ms and every later call is sub-millisecond, so paying
+    // it here keeps it off whichever request the user happens to send first.
+    try {
+      tokens.warmup_tokenizer();
+    } catch {}
     const targetPort = port !== undefined && port !== null ? port : loadConfig().port || DEFAULT_PORT;
     // Another process (watchdog, desktop app, an earlier CLI) may already own the
     // port. Kill it and start fresh, so `proxy start` always gives a live server

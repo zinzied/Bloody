@@ -1516,3 +1516,81 @@ export function format_rtk_log(stats: CompressStats | null): string | null {
   const filters = [...new Set(stats.hits.map((h) => h.filter))].join(',');
   return `[RTK] saved ${saved}B / ${stats.bytesBefore}B (${pct}%) via [${filters}] hits=${stats.hits.length}`;
 }
+
+// ---------------------------------------------------------------------------
+// Shape diagnostic
+//
+// compress_messages() only rewrites text carried by tool results — a `role:
+// 'tool'` message, a `tool_result` block, or a `function_call_output`. Plain user
+// and assistant text is passed through untouched, because rewriting the
+// conversation itself would change what the model is being asked.
+//
+// That makes "saved 0B" ambiguous on its own: the same number means both "there
+// was nothing worth shrinking" and "you sent it in a shape the compressor never
+// looks at". Reporting the per-role byte totals separates those two, and it needs
+// only sizes — no content is read or stored.
+// ---------------------------------------------------------------------------
+
+/** Text a `*`-marked entry in the summary below: content the compressor rewrites. */
+function _shape_text(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (!Array.isArray(value)) return '';
+  let out = '';
+  for (const part of value) {
+    if (part && typeof part === 'object' && typeof (part as Record<string, unknown>).text === 'string') {
+      out += (part as Record<string, unknown>).text as string;
+    }
+  }
+  return out;
+}
+
+/**
+ * Per-role byte totals for a request body, e.g.
+ * `tool* 18.2KB×3 · assistant 4.1KB×12 · user 220B×1`.
+ *
+ * A `*` marks the roles whose text the compressor can actually shrink.
+ */
+export function summarize_body_shapes(body: RequestBody): string {
+  const items: any[] | null =
+    body && Array.isArray((body as any).messages)
+      ? (body as any).messages
+      : body && Array.isArray((body as any).input)
+        ? (body as any).input
+        : null;
+  if (!items) return '';
+
+  const totals = new Map<string, { bytes: number; n: number }>();
+  const add = (label: string, text: string): void => {
+    if (!text) return;
+    const cur = totals.get(label) || { bytes: 0, n: 0 };
+    cur.bytes += text.length;
+    cur.n += 1;
+    totals.set(label, cur);
+  };
+
+  for (const msg of items) {
+    if (!msg || typeof msg !== 'object') continue;
+    if (msg.type === 'function_call_output') {
+      add('function_call_output*', _shape_text(msg.output));
+      continue;
+    }
+    const role = typeof msg.role === 'string' && msg.role ? msg.role : 'other';
+    const label = role === 'tool' ? `${role}*` : role;
+    if (typeof msg.content === 'string') {
+      add(label, msg.content);
+      continue;
+    }
+    if (!Array.isArray(msg.content)) continue;
+    for (const block of msg.content) {
+      if (!block || typeof block !== 'object') continue;
+      const type = (block as Record<string, unknown>).type;
+      if (type === 'tool_result') add('tool_result*', _shape_text((block as Record<string, unknown>).content));
+      else add(label, _shape_text(block));
+    }
+  }
+
+  const size = (bytes: number): string => (bytes >= 1024 ? `${(bytes / 1024).toFixed(1)}KB` : `${bytes}B`);
+  return [...totals.entries()]
+    .map(([label, t]) => `${label} ${size(t.bytes)}×${t.n}`)
+    .join(' · ');
+}

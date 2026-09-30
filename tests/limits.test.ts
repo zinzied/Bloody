@@ -287,3 +287,66 @@ test('a proxied request bills both sides of the exchange to the daily budget', a
     mock.close();
   }
 });
+
+test('every proxied request records where its time went', async () => {
+  // Without this split a slow turn cannot be attributed: the log said a request
+  // happened and when, which is no use when a turn takes a minute. `prep` is the
+  // proxy's own work, `upstream` is the provider, and the rest of the client's
+  // stopwatch is time the proxy never saw.
+  const UPSTREAM_DELAY = 120;
+  const mock = http.createServer((req, res) => {
+    req.on('data', () => {});
+    req.on('end', () => {
+      setTimeout(() => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ id: 'x', choices: [{ message: { role: 'assistant', content: 'ok' } }] }));
+      }, UPSTREAM_DELAY);
+    });
+  });
+  const mockPort = await listen(mock);
+  proxy.saveConfig({
+    port: 0,
+    enabled: false,
+    proxied_providers: ['openai'],
+    saved_base_urls: { openai: `http://127.0.0.1:${mockPort}/v1` },
+  });
+
+  resetAll();
+  await proxy.start(0);
+  try {
+    const body = JSON.stringify({ model: 'openai/gpt-4o', messages: [{ role: 'user', content: 'hey' }] });
+    const s = await post(proxy.status().port!, '/v1/chat/completions', body);
+    assert.strictEqual(s.status, 200);
+
+    const hist = proxy.loadConfig().history || [];
+    const last = hist[hist.length - 1];
+    assert.ok(last, 'the request was recorded');
+
+    assert.strictEqual(last.body_bytes, Buffer.byteLength(body), 'the size as received is recorded');
+    assert.ok((last.sent_bytes ?? 0) > 0, 'the size sent upstream is recorded');
+    assert.ok((last.duration_ms ?? 0) > 0, 'the total is recorded');
+
+    // The mock deliberately stalls, so the provider's share must show up as
+    // provider time and not be quietly absorbed into the proxy's own. The floor
+    // is loose on purpose — the point is attribution, not timer precision.
+    assert.ok(
+      (last.upstream_ms ?? 0) >= UPSTREAM_DELAY - 40,
+      `upstream_ms ${last.upstream_ms} should account for the ${UPSTREAM_DELAY}ms stall`
+    );
+    assert.ok(
+      (last.prep_ms ?? -1) < 50,
+      `prep ${last.prep_ms}ms is the proxy's own work and should stay negligible`
+    );
+    assert.ok(
+      (last.ttfb_ms ?? 0) >= (last.upstream_ms ?? 0),
+      'time to first byte cannot precede the headers'
+    );
+    assert.ok(
+      (last.duration_ms ?? 0) >= (last.ttfb_ms ?? 0),
+      'the total cannot be shorter than the wait for the first byte'
+    );
+  } finally {
+    await proxy.stop();
+    mock.close();
+  }
+});

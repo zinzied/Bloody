@@ -469,6 +469,57 @@ test('proxy escalates the level once the request context is large', async () => 
   }
 });
 
+test('a body too small to escalate is not tokenized to find that out', async () => {
+  // Deciding the level by measuring the request meant tokenizing every body on
+  // every request, which is pure cost for the small requests that dominate a
+  // session and cannot possibly reach the first threshold anyway.
+  delete process.env.NOBLEED_OUTPUT_STYLE;
+  const seen: { body: string; path: string }[] = [];
+  const mock = mockUpstream(seen);
+  const mockPort = await listen(mock);
+  const prev = proxy.loadConfig();
+  proxy.saveConfig({
+    port: 0,
+    enabled: false,
+    proxied_providers: ['openai'],
+    saved_base_urls: { openai: `http://127.0.0.1:${mockPort}/v1` },
+  });
+  proxy.setOutputStyle('caveman-lite');
+  proxy.saveConfig({ ...proxy.loadConfig(), output_style: 'caveman-lite', output_style_escalate_at: [20000, 60000] });
+
+  await proxy.start(0);
+  try {
+    const port = proxy.status().port;
+    // The escalation counter is process-wide and a sibling test already moved it.
+    const escalatedBefore = proxy.status().outputStyleEscalated ?? 0;
+    const post = (content: string) =>
+      request(
+        'POST',
+        port,
+        '/v1/chat/completions',
+        JSON.stringify({ model: 'openai/gpt-4o', messages: [{ role: 'user', content }] })
+      );
+
+    // A short request stays on the base level, which is the whole point: 3 bytes
+    // of user text must not cost a tokenizer pass over the request.
+    for (let i = 0; i < 20; i++) assert.strictEqual((await post('hey')).status, 200);
+    const sent = seen.map((s) => JSON.parse(s.body));
+    assert.strictEqual(sent.length, 20);
+    for (const body of sent) {
+      assert.ok(body.messages[0].content.includes(prompts.CAVEMAN_PROMPTS.lite), 'base level applied');
+    }
+    const s = proxy.status();
+    assert.strictEqual(s.outputStyleEscalated ?? 0, escalatedBefore, 'nothing escalated');
+    assert.ok((s.outputStyleApplied ?? 0) >= 20, 'the style still applied');
+  } finally {
+    await proxy.stop();
+    mock.close();
+    proxy.setOutputStyleEscalation(true);
+    proxy.setOutputStyle('caveman-lite');
+    proxy.saveConfig(prev);
+  }
+});
+
 test('escalation can be pinned off, and the setting round-trips', async () => {
   await proxy.start(0);
   try {

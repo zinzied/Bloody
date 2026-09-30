@@ -86,6 +86,34 @@ export interface ProxyHistoryEntry {
   upstream?: string;
   timestamp?: number;
   ts_iso?: string;
+  /** Request body size in bytes as received, before any compression. */
+  body_bytes?: number;
+  /**
+   * Per-role byte totals of the request as the client sent it, e.g.
+   * `tool* 18.2KB×3 · assistant 4.1KB×12`. Sizes only, no content. A `*` marks
+   * the roles the compressor can shrink, so a zero in the saved-bytes column can
+   * be read against what actually arrived.
+   */
+  body_shape?: string;
+  /** Size actually sent upstream, after compression and prompt injection. */
+  sent_bytes?: number;
+  /**
+   * Wall-clock milliseconds the proxy held the request: received until the
+   * response finished. This is the number to compare against the client's own
+   * timing — the gap between the two is time spent outside the proxy.
+   */
+  duration_ms?: number;
+  /** Milliseconds until upstream answered with response headers. */
+  upstream_ms?: number;
+  /** Milliseconds until the first response byte reached the client. */
+  ttfb_ms?: number;
+  /**
+   * Milliseconds of the proxy's own work before forwarding: JSON parse, output
+   * style, project map, compression. This is the only part NoBleed can be blamed
+   * for; `upstream_ms` is the provider, and anything past `duration_ms` is the
+   * client or the network.
+   */
+  prep_ms?: number;
 }
 
 export interface ProxyConfig {

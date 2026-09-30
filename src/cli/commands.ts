@@ -147,7 +147,7 @@ async function cmdUsage(): Promise<number> {
   printTable(['Model', 'Requests', 'Tokens saved', 'Bytes saved'], u.perModel.map((m) => [m.model, fmt(m.requests), fmt(m.saved_tokens), `${fmt(m.saved_bytes)}B`]));
   out();
   out('Recent activity:');
-  printTable(['Time', 'Kind', 'Description', 'Saved'], u.recent.map((r) => [r.ts, r.kind, r.description, `${fmt(r.saved)}${r.unit}`]));
+  printTable(['Time', 'Kind', 'Description', 'Timing', 'Saved'], u.recent.map((r) => [r.ts, r.kind, r.description, r.timing || '-', `${fmt(r.saved)}${r.unit}`]));
   return 0;
 }
 

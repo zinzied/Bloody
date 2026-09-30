@@ -82,6 +82,7 @@ export function usageSummary() {
       description: e.description || '',
       saved: e.saved_tokens || 0,
       unit: 'tok',
+      timing: '',
     })),
     ...history.slice(-10).map((h) => ({
       ts: typeof h.timestamp === 'number' ? h.timestamp * 1000 : Date.parse(h.timestamp || '') || 0,
@@ -89,6 +90,20 @@ export function usageSummary() {
       description: `${h.model || 'unknown'} — ${h.path || ''}`,
       saved: h.saved_tokens || h.saved_bytes || 0,
       unit: h.saved_tokens ? 'tok' : 'B',
+      // The latency split, so a slow turn can be attributed without guesswork:
+      // `prep` is the proxy's own work, `upstream` is the provider, and anything
+      // beyond `total` was spent outside the proxy entirely.
+      timing: typeof h.duration_ms === 'number'
+        ? [
+            `total ${h.duration_ms}ms`,
+            typeof h.prep_ms === 'number' ? `prep ${h.prep_ms}` : null,
+            typeof h.ttfb_ms === 'number' ? `ttfb ${h.ttfb_ms}` : null,
+            typeof h.body_bytes === 'number' ? `${Math.round(h.body_bytes / 1024)}KB` : null,
+            h.body_shape || null,
+          ]
+            .filter(Boolean)
+            .join(' · ')
+        : h.body_shape || '',
     })),
   ]
     .sort((a, b) => b.ts - a.ts)
